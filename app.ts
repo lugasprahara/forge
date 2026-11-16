@@ -1,12 +1,22 @@
-// The HTTP surface: one server routing the four surfaces the suite drives —
-//   GET  /healthz                              the env's boot probe
-//   /{owner}/{repo}.git/info/refs|git-upload-pack|git-receive-pack   git smart HTTP
-//   /api/v3/*                                  REST v3
-//   /api/graphql                               GraphQL v4
-//   /mcp                                       MCP (JSON-RPC over Streamable HTTP)
-// Auth: the trial token (MAKEFUN_SHOP_TOKEN) as a Bearer token on the API
-// surfaces; a request without it is a 401. Git smart HTTP answers the suite's
-// client, which presents the same token, and stays readable like a public repo.
+// app.ts -- the HTTP front door. One server routes the four surfaces the suite
+// drives:
+//
+//   GET  /healthz                                    the suite's boot probe
+//   /{owner}/{repo}.git/info/refs, git-upload-pack, git-receive-pack
+//   /api/v3/*                                        REST v3
+//   /api/graphql                                     GraphQL v4
+//   /mcp                                             MCP
+//
+// The API surfaces take the trial token (MAKEFUN_SHOP_TOKEN) as a Bearer
+// token; a request without it is a 401. Git smart HTTP answers the suite's
+// client, which presents the same token, and stays readable like a public
+// repository.
+//
+// Routing works on the raw request target -- split at the first "?", segments
+// percent-decoded only when a "%" is actually present -- rather than through
+// the WHATWG URL parser: the read benchmark issues thousands of small GETs,
+// and the cheap split keeps their per-request cost in the handlers, not in
+// URL machinery.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Forge, VIEWER } from './forge.ts';
@@ -19,21 +29,19 @@ import { isRecord, parseJsonBody, readBody, sendError, sendJson } from './webuti
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 function isAuthorized(req: IncomingMessage): boolean {
-  if (TOKEN === '') return true;
-  const header = req.headers.authorization ?? '';
-  return header === `Bearer ${TOKEN}`;
+  return TOKEN === '' || req.headers.authorization === `Bearer ${TOKEN}`;
 }
 
-function pathOf(req: IncomingMessage): { pathname: string; query: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return { pathname: url.pathname, query: url.searchParams };
-  } catch {
-    return { pathname: '/', query: new URLSearchParams() };
-  }
+interface SplitTarget {
+  /** The path, still percent-encoded. */
+  path: string;
+  /** The decoded, non-empty path segments. */
+  segments: string[];
+  query: URLSearchParams;
 }
 
 function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -41,28 +49,33 @@ function decodeSegment(segment: string): string {
   }
 }
 
+function splitTarget(rawUrl: string): SplitTarget {
+  const q = rawUrl.indexOf('?');
+  const path = q < 0 ? rawUrl : rawUrl.slice(0, q);
+  const query = new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1));
+  const segments = path.split('/').filter((part) => part !== '').map(decodeSegment);
+  return { path, segments, query };
+}
+
 async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const { pathname, query } = pathOf(req);
-  const segments = pathname.split('/').filter((part) => part !== '').map(decodeSegment);
+  const { path, segments, query } = splitTarget(req.url ?? '/');
 
-  if (method === 'GET' && pathname === '/healthz') {
+  if (method === 'GET' && path === '/healthz') {
     sendJson(res, 200, { ok: true });
     return;
   }
 
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1]!.endsWith('.git')) {
-    const owner = segments[0]!;
-    const repoName = segments[1]!.slice(0, -'.git'.length);
-    const repo = forge.getRepo(owner, repoName);
+    const repo = forge.getRepo(segments[0]!, segments[1]!.slice(0, -'.git'.length));
     const tail = segments.slice(2).join('/');
+    if (repo === null || (tail !== 'info/refs' && tail !== 'git-upload-pack' && tail !== 'git-receive-pack')) {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end(repo === null ? 'repository not found\n' : 'not found\n');
+      return;
+    }
     if (method === 'GET' && tail === 'info/refs') {
-      if (repo === null) {
-        res.writeHead(404, { 'content-type': 'text/plain' });
-        res.end('repository not found\n');
-        return;
-      }
       const service = query.get('service');
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         res.writeHead(400, { 'content-type': 'text/plain' });
@@ -73,15 +86,12 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
       advertise(forge, repo, service, wantsV2, res);
       return;
     }
-    if (method === 'POST' && (tail === 'git-upload-pack' || tail === 'git-receive-pack')) {
-      if (repo === null) {
-        res.writeHead(404, { 'content-type': 'text/plain' });
-        res.end('repository not found\n');
-        return;
-      }
-      const body = await readBody(req);
-      if (tail === 'git-upload-pack') handleUploadPack(forge, repo, body, res);
-      else await handleReceivePack(forge, repo, body, res);
+    if (method === 'POST' && tail === 'git-upload-pack') {
+      handleUploadPack(forge, repo, await readBody(req), res);
+      return;
+    }
+    if (method === 'POST' && tail === 'git-receive-pack') {
+      await handleReceivePack(forge, repo, await readBody(req), res);
       return;
     }
     res.writeHead(404, { 'content-type': 'text/plain' });
@@ -100,16 +110,15 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
       sendError(res, 400, 'Problems parsing JSON');
       return;
     }
-    const host = req.headers.host ?? 'entry';
-    const restRequest: RestRequest = {
+    const request: RestRequest = {
       method,
       segments: segments.slice(2),
       query,
       body,
-      origin: `http://${host}`,
-      path: pathname,
+      origin: `http://${req.headers.host ?? 'entry'}`,
+      path,
     };
-    handleRest(forge, restRequest, res);
+    handleRest(forge, request, res);
     return;
   }
 
@@ -161,13 +170,11 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
       sendError(res, 401, 'Unauthorized');
       return;
     }
-    const body = await readBody(req);
-    handleMcp(forge, body, res);
+    handleMcp(forge, await readBody(req), res);
     return;
   }
 
-  // The API root also answers outside the /api/v3 prefix handling above.
-  if (method === 'GET' && (pathname === '/' || pathname === '/api')) {
+  if (method === 'GET' && (path === '/' || path === '/api')) {
     sendJson(res, 200, { current_user_url: '/api/v3/user', viewer: VIEWER.login });
     return;
   }
@@ -175,18 +182,18 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
   sendError(res, 404, 'Not Found');
 }
 
-/** Build the server. It binds nothing until the caller listens. */
+/** Build the server; it binds nothing until the caller listens. */
 export function createApp(): Server {
   const forge = new Forge();
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     route(forge, req, res).catch((err: unknown) => {
-      // A request must never take the process down: the suite proves the server
+      // No request may take the process down: the suite proves the forge
       // survives malformed input and keeps serving afterwards.
       try {
         if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
         else res.end();
       } catch {
-        // The socket is already gone; nothing more to do.
+        // The socket is already gone.
       }
       process.stderr.write(`[entry] request failed: ${err instanceof Error ? err.message : String(err)}\n`);
     });

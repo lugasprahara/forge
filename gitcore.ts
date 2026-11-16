@@ -1,7 +1,16 @@
-// Pure-JS git object model: SHA-1 ids, loose-object store (in memory), tree/commit/tag
-// parsing and serialising, packfile read (with OFS/REF delta application) and packfile
-// write (plain, non-delta entries — a valid pack everywhere), and the pkt-line codec.
-// Only node:crypto and node:zlib are used; there is no git binary in the trial pod.
+// gitcore.ts -- the git object model this forge runs on, plus its packfile codec.
+//
+// Objects are content-addressed by SHA-1 over "<type> <length>\0<bytes>", held in
+// one in-memory map. Trees, commits and tags are parsed lazily and the parses are
+// cached beside the raw bytes; flattened file listings of trees are cached too,
+// because merges and diffs ask for them again and again over the same trees.
+//
+// The pack reader resolves OFS/REF deltas and reports every object's id as it
+// goes, so a receive never has to hash the same bytes twice. Inflating a pack
+// entry is a single zlib pass that asks the engine how many input bytes it ate,
+// instead of probing prefix lengths until one inflates.
+//
+// Only node:crypto and node:zlib are used: the trial pod has no git binary.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -13,6 +22,11 @@ export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject {
   type: GitObjectType;
   data: Buffer;
+}
+
+/** An object together with the id it hashes to. */
+export interface KnownObject extends GitObject {
+  oid: string;
 }
 
 export function hashObject(type: GitObjectType, data: Buffer): string {
@@ -27,20 +41,22 @@ export function isOid(value: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// the object store
+// the store
 
 export class ObjectStore {
   readonly objects = new Map<string, GitObject>();
-  private readonly commitCache = new Map<string, ParsedCommit>();
-  private readonly treeCache = new Map<string, TreeEntry[]>();
+  private readonly parsedCommits = new Map<string, ParsedCommit>();
+  private readonly parsedTrees = new Map<string, TreeEntry[]>();
+  private readonly flatListings = new Map<string, Map<string, string>>();
 
+  /** Hash `data` and keep it under its id (a no-op when already present). */
   add(type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
     return oid;
   }
 
-  /** Store an object whose id is already known (from a received pack). */
+  /** Keep an object whose id the caller already knows (a received pack entry). */
   put(oid: string, type: GitObjectType, data: Buffer): void {
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
   }
@@ -53,24 +69,51 @@ export class ObjectStore {
     return this.objects.has(oid);
   }
 
+  /** The parsed commit at `oid`, or null when it is not a commit we hold. */
   commit(oid: string): ParsedCommit | null {
-    const cached = this.commitCache.get(oid);
-    if (cached) return cached;
-    const object = this.objects.get(oid);
-    if (!object || object.type !== 'commit') return null;
-    const parsed = parseCommit(object.data);
-    this.commitCache.set(oid, parsed);
+    let parsed = this.parsedCommits.get(oid);
+    if (parsed === undefined) {
+      const object = this.objects.get(oid);
+      if (object === undefined || object.type !== 'commit') return null;
+      parsed = parseCommit(object.data);
+      this.parsedCommits.set(oid, parsed);
+    }
     return parsed;
   }
 
+  /** The parsed entries of the tree at `oid`, or null when it is not a tree. */
   tree(oid: string): TreeEntry[] | null {
-    const cached = this.treeCache.get(oid);
-    if (cached) return cached;
-    const object = this.objects.get(oid);
-    if (!object || object.type !== 'tree') return null;
-    const parsed = parseTree(object.data);
-    this.treeCache.set(oid, parsed);
+    let parsed = this.parsedTrees.get(oid);
+    if (parsed === undefined) {
+      const object = this.objects.get(oid);
+      if (object === undefined || object.type !== 'tree') return null;
+      parsed = parseTree(object.data);
+      this.parsedTrees.set(oid, parsed);
+    }
     return parsed;
+  }
+
+  /**
+   * Every file under the tree at `treeOid`, as path -> blob oid (gitlinks are
+   * skipped: they name a commit of some other repository). The map is cached
+   * and shared, so callers must treat it as read-only.
+   */
+  flattenTree(treeOid: string): Map<string, string> {
+    let flat = this.flatListings.get(treeOid);
+    if (flat !== undefined) return flat;
+    flat = new Map<string, string>();
+    const descend = (oid: string, prefix: string): void => {
+      const entries = this.tree(oid);
+      if (entries === null) return;
+      for (const entry of entries) {
+        const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+        if (entry.mode === '40000') descend(entry.oid, path);
+        else if (entry.mode !== '160000') flat.set(path, entry.oid);
+      }
+    };
+    descend(treeOid, '');
+    this.flatListings.set(treeOid, flat);
+    return flat;
   }
 }
 
@@ -78,7 +121,7 @@ export class ObjectStore {
 // trees
 
 export interface TreeEntry {
-  /** The mode exactly as stored, e.g. "100644" or "40000" for a directory. */
+  /** The mode exactly as it sits in the tree object, e.g. "100644", "40000". */
   mode: string;
   name: string;
   oid: string;
@@ -86,37 +129,39 @@ export interface TreeEntry {
 
 export function parseTree(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
+  let at = 0;
+  while (at < data.length) {
+    const space = data.indexOf(0x20, at);
     if (space < 0) break;
-    const mode = data.subarray(offset, space).toString('ascii');
     const nul = data.indexOf(0x00, space + 1);
     if (nul < 0 || nul + 21 > data.length) break;
-    const name = data.subarray(space + 1, nul).toString('utf8');
-    const oid = data.subarray(nul + 1, nul + 21).toString('hex');
-    entries.push({ mode, name, oid });
-    offset = nul + 21;
+    entries.push({
+      mode: data.subarray(at, space).toString('ascii'),
+      name: data.subarray(space + 1, nul).toString('utf8'),
+      oid: data.subarray(nul + 1, nul + 21).toString('hex'),
+    });
+    at = nul + 21;
   }
   return entries;
 }
 
-function treeSortKey(entry: TreeEntry): string {
+/** Git orders tree entries by name, directories as if the name ended in "/". */
+function treeOrderKey(entry: TreeEntry): string {
   return entry.mode === '40000' ? `${entry.name}/` : entry.name;
 }
 
 export function buildTree(entries: readonly TreeEntry[]): Buffer {
-  const sorted = [...entries].sort((a, b) => {
-    const ka = treeSortKey(a);
-    const kb = treeSortKey(b);
+  const ordered = [...entries].sort((a, b) => {
+    const ka = treeOrderKey(a);
+    const kb = treeOrderKey(b);
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
-  const parts: Buffer[] = [];
-  for (const entry of sorted) {
-    parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
-    parts.push(Buffer.from(entry.oid, 'hex'));
+  const chunks: Buffer[] = [];
+  for (const entry of ordered) {
+    chunks.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
+    chunks.push(Buffer.from(entry.oid, 'hex'));
   }
-  return Buffer.concat(parts);
+  return Buffer.concat(chunks);
 }
 
 // ---------------------------------------------------------------------------
@@ -127,32 +172,34 @@ export interface ParsedCommit {
   parents: string[];
   author: string;
   committer: string;
-  /** Committer timestamp, seconds. */
+  /** Committer timestamp, in seconds. */
   timestamp: number;
   message: string;
 }
 
 export function parseCommit(data: Buffer): ParsedCommit {
   const text = data.toString('utf8');
-  const blank = text.indexOf('\n\n');
-  const header = blank >= 0 ? text.slice(0, blank) : text;
-  const message = blank >= 0 ? text.slice(blank + 2) : '';
-  let tree = '';
-  const parents: string[] = [];
-  let author = '';
-  let committer = '';
-  let timestamp = 0;
+  const split = text.indexOf('\n\n');
+  const header = split >= 0 ? text.slice(0, split) : text;
+  const parsed: ParsedCommit = {
+    tree: '',
+    parents: [],
+    author: '',
+    committer: '',
+    timestamp: 0,
+    message: split >= 0 ? text.slice(split + 2) : '',
+  };
   for (const line of header.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
-    else if (line.startsWith('author ')) author = line.slice(7);
+    if (line.startsWith('tree ')) parsed.tree = line.slice(5).trim();
+    else if (line.startsWith('parent ')) parsed.parents.push(line.slice(7).trim());
+    else if (line.startsWith('author ')) parsed.author = line.slice(7);
     else if (line.startsWith('committer ')) {
-      committer = line.slice(10);
-      const match = / (\d+) [+-]\d{4}$/.exec(committer);
-      if (match) timestamp = Number(match[1]);
+      parsed.committer = line.slice(10);
+      const stamp = / (\d+) [+-]\d{4}$/.exec(parsed.committer);
+      if (stamp !== null) parsed.timestamp = Number(stamp[1]);
     }
   }
-  return { tree, parents, author, committer, timestamp, message };
+  return parsed;
 }
 
 export interface CommitSpec {
@@ -164,10 +211,10 @@ export interface CommitSpec {
 }
 
 export function buildCommit(spec: CommitSpec): Buffer {
-  let text = `tree ${spec.tree}\n`;
-  for (const parent of spec.parents) text += `parent ${parent}\n`;
-  text += `author ${spec.author}\ncommitter ${spec.committer}\n\n${spec.message}`;
-  return Buffer.from(text, 'utf8');
+  const lines = [`tree ${spec.tree}`];
+  for (const parent of spec.parents) lines.push(`parent ${parent}`);
+  lines.push(`author ${spec.author}`, `committer ${spec.committer}`, '', spec.message);
+  return Buffer.from(lines.join('\n'), 'utf8');
 }
 
 export interface ParsedTag {
@@ -180,49 +227,51 @@ export interface ParsedTag {
 
 export function parseTag(data: Buffer): ParsedTag {
   const text = data.toString('utf8');
-  const blank = text.indexOf('\n\n');
-  const header = blank >= 0 ? text.slice(0, blank) : text;
-  const out: ParsedTag = { object: '', type: '', tag: '', tagger: '', message: blank >= 0 ? text.slice(blank + 2) : '' };
+  const split = text.indexOf('\n\n');
+  const header = split >= 0 ? text.slice(0, split) : text;
+  const parsed: ParsedTag = {
+    object: '',
+    type: '',
+    tag: '',
+    tagger: '',
+    message: split >= 0 ? text.slice(split + 2) : '',
+  };
   for (const line of header.split('\n')) {
-    if (line.startsWith('object ')) out.object = line.slice(7).trim();
-    else if (line.startsWith('type ')) out.type = line.slice(5).trim();
-    else if (line.startsWith('tag ')) out.tag = line.slice(4).trim();
-    else if (line.startsWith('tagger ')) out.tagger = line.slice(7);
+    if (line.startsWith('object ')) parsed.object = line.slice(7).trim();
+    else if (line.startsWith('type ')) parsed.type = line.slice(5).trim();
+    else if (line.startsWith('tag ')) parsed.tag = line.slice(4).trim();
+    else if (line.startsWith('tagger ')) parsed.tagger = line.slice(7);
   }
-  return out;
+  return parsed;
 }
 
-/** The commit a (possibly annotated) tag ultimately points at, or null. */
+/** Follow tag objects until a commit turns up (or something else stops us). */
 export function peelToCommit(store: ObjectStore, oid: string): string | null {
   let current = oid;
-  for (let depth = 0; depth < 16; depth += 1) {
+  for (let hop = 0; hop < 16; hop += 1) {
     const object = store.get(current);
-    if (!object) return null;
+    if (object === undefined) return null;
     if (object.type === 'commit') return current;
-    if (object.type === 'tag') {
-      current = parseTag(object.data).object;
-      continue;
-    }
-    return null;
+    if (object.type !== 'tag') return null;
+    current = parseTag(object.data).object;
   }
   return null;
 }
 
-/** The object a tag points at (one level), or the oid itself for non-tags. */
+/** One peel: a tag's target, or the oid itself for anything else. */
 export function peelOne(store: ObjectStore, oid: string): string {
   const object = store.get(oid);
-  if (object && object.type === 'tag') return parseTag(object.data).object;
-  return oid;
+  return object !== undefined && object.type === 'tag' ? parseTag(object.data).object : oid;
 }
 
 // ---------------------------------------------------------------------------
 // reachability
 
-/** Add a tree and everything under it to `into`. */
+/** Add a tree and everything beneath it to `into`. */
 export function addTreeClosure(store: ObjectStore, treeOid: string, into: Set<string>): void {
   if (into.has(treeOid)) return;
   const entries = store.tree(treeOid);
-  if (!entries) return;
+  if (entries === null) return;
   into.add(treeOid);
   for (const entry of entries) {
     if (entry.mode === '40000') addTreeClosure(store, entry.oid, into);
@@ -230,23 +279,23 @@ export function addTreeClosure(store: ObjectStore, treeOid: string, into: Set<st
   }
 }
 
-/** Every object reachable from `tip` (commit history, trees, blobs, tag targets). */
+/** Every object reachable from `tip`: history, trees, blobs and tag targets. */
 export function reachableFrom(store: ObjectStore, tip: string, into: Set<string> = new Set()): Set<string> {
-  const stack = [tip];
-  while (stack.length > 0) {
-    const oid = stack.pop()!;
+  const pending = [tip];
+  while (pending.length > 0) {
+    const oid = pending.pop()!;
     if (into.has(oid)) continue;
     const object = store.get(oid);
-    if (!object) continue;
+    if (object === undefined) continue;
     into.add(oid);
     if (object.type === 'commit') {
       const commit = store.commit(oid);
-      if (commit) {
+      if (commit !== null) {
         addTreeClosure(store, commit.tree, into);
-        for (const parent of commit.parents) stack.push(parent);
+        for (const parent of commit.parents) pending.push(parent);
       }
     } else if (object.type === 'tag') {
-      stack.push(parseTag(object.data).object);
+      pending.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
       addTreeClosure(store, oid, into);
     }
@@ -254,45 +303,64 @@ export function reachableFrom(store: ObjectStore, tip: string, into: Set<string>
   return into;
 }
 
-/** All commit ancestors of `tip`, including `tip` itself. */
+/** All commits reachable from `tip`, `tip` itself included. */
 export function commitAncestors(store: ObjectStore, tip: string): Set<string> {
   const out = new Set<string>();
-  const stack = [tip];
-  while (stack.length > 0) {
-    const oid = stack.pop()!;
+  const pending = [tip];
+  while (pending.length > 0) {
+    const oid = pending.pop()!;
     if (out.has(oid)) continue;
     const commit = store.commit(oid);
-    if (!commit) continue;
+    if (commit === null) continue;
     out.add(oid);
-    for (const parent of commit.parents) stack.push(parent);
+    for (const parent of commit.parents) pending.push(parent);
   }
   return out;
 }
 
-/** Whether `ancestor` is `descendant` itself or one of its ancestors. */
+/**
+ * Whether `ancestor` is `descendant` or one of its ancestors. The walk stops
+ * the moment the ancestor turns up: a push that extends a branch by one commit
+ * (the common case, and the benchmark's) is answered at the first parent
+ * instead of by collecting the branch's whole history into a set.
+ */
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(store, descendant).has(ancestor);
+  const seen = new Set<string>([descendant]);
+  const pending = [descendant];
+  while (pending.length > 0) {
+    const oid = pending.pop()!;
+    const commit = store.commit(oid);
+    if (commit === null) continue;
+    for (const parent of commit.parents) {
+      if (parent === ancestor) return true;
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        pending.push(parent);
+      }
+    }
+  }
+  return false;
 }
 
 /**
- * The best common ancestor of two commits: the common ancestor that is not itself an
- * ancestor of another common ancestor. Histories here are near-linear, so the first
- * common commit met walking back from `b` (newest first) is the merge base.
+ * The best common ancestor of two commits. The histories this forge sees are
+ * near-linear, so: check the two tips against each other's ancestry, then walk
+ * `b` generation by generation and take the first commit that is an ancestor
+ * of `a`.
  */
 export function mergeBase(store: ObjectStore, a: string, b: string): string | null {
   const ancestorsOfA = commitAncestors(store, a);
   if (ancestorsOfA.has(b)) return b;
-  if (commitAncestors(store, b).has(a)) return a;
-  // Walk b's history breadth-first by generation so the newest common commit wins.
+  if (isAncestor(store, a, b)) return a;
+  const seen = new Set<string>([b]);
   let frontier = [b];
-  const seen = new Set<string>(frontier);
   while (frontier.length > 0) {
     const next: string[] = [];
     for (const oid of frontier) {
       if (ancestorsOfA.has(oid)) return oid;
       const commit = store.commit(oid);
-      if (commit) {
+      if (commit !== null) {
         for (const parent of commit.parents) {
           if (!seen.has(parent)) {
             seen.add(parent);
@@ -307,26 +375,25 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
 }
 
 // ---------------------------------------------------------------------------
-// pkt-line codec
+// pkt-lines
 
 export type PktLine = string | 'flush' | 'delim' | 'response-end';
 
 export function encodePktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const length = body.length + 4;
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
+  const header = Buffer.from((body.length + 4).toString(16).padStart(4, '0'), 'ascii');
   return Buffer.concat([header, body]);
 }
 
 export function encodePktLines(lines: readonly PktLine[]): Buffer {
-  const parts: Buffer[] = [];
+  const chunks: Buffer[] = [];
   for (const line of lines) {
-    if (line === 'flush') parts.push(Buffer.from('0000', 'ascii'));
-    else if (line === 'delim') parts.push(Buffer.from('0001', 'ascii'));
-    else if (line === 'response-end') parts.push(Buffer.from('0002', 'ascii'));
-    else parts.push(encodePktLine(line));
+    if (line === 'flush') chunks.push(Buffer.from('0000', 'ascii'));
+    else if (line === 'delim') chunks.push(Buffer.from('0001', 'ascii'));
+    else if (line === 'response-end') chunks.push(Buffer.from('0002', 'ascii'));
+    else chunks.push(encodePktLine(line));
   }
-  return Buffer.concat(parts);
+  return Buffer.concat(chunks);
 }
 
 export interface PktPacket {
@@ -334,31 +401,31 @@ export interface PktPacket {
   payload: Buffer;
 }
 
-/** Decode a complete pkt-line stream; throws on malformed framing. */
+/** Decode a whole pkt-line stream; throws on malformed framing. */
 export function decodePktLines(buffer: Buffer): PktPacket[] {
   const packets: PktPacket[] = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    if (offset + 4 > buffer.length) throw new Error('truncated pkt-line header');
-    const hex = buffer.subarray(offset, offset + 4).toString('ascii');
+  let at = 0;
+  while (at < buffer.length) {
+    if (at + 4 > buffer.length) throw new Error('truncated pkt-line header');
+    const hex = buffer.subarray(at, at + 4).toString('ascii');
     if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`bad pkt-line length ${JSON.stringify(hex)}`);
     const length = parseInt(hex, 16);
     if (length === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
-      offset += 4;
+      at += 4;
     } else if (length === 1) {
       packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
-      offset += 4;
+      at += 4;
     } else if (length === 2) {
       packets.push({ kind: 'response-end', payload: Buffer.alloc(0) });
-      offset += 4;
+      at += 4;
     } else if (length === 3) {
       packets.push({ kind: 'data', payload: Buffer.alloc(0) });
-      offset += 4;
+      at += 4;
     } else {
-      if (length < 4 || offset + length > buffer.length) throw new Error('pkt-line overruns the buffer');
-      packets.push({ kind: 'data', payload: Buffer.from(buffer.subarray(offset + 4, offset + length)) });
-      offset += length;
+      if (length < 4 || at + length > buffer.length) throw new Error('pkt-line overruns the buffer');
+      packets.push({ kind: 'data', payload: Buffer.from(buffer.subarray(at + 4, at + length)) });
+      at += length;
     }
   }
   return packets;
@@ -377,47 +444,66 @@ const TYPE_NAMES: Record<number, GitObjectType | 'ofs-delta' | 'ref-delta'> = {
   7: 'ref-delta',
 };
 
-/** Write a version-2 pack of plain (non-delta) objects with a SHA-1 trailer. */
+/**
+ * A version-2 pack of plain (never delta) entries with a SHA-1 trailer. The
+ * zlib level leans toward speed: a pack is read once by its receiver, and the
+ * streams stay small either way.
+ */
 export function writePack(objects: readonly GitObject[]): Buffer {
-  const parts: Buffer[] = [];
+  const chunks: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.length, 8);
-  parts.push(header);
+  chunks.push(header);
   for (const object of objects) {
-    let size = object.data.length;
-    const typeId = TYPE_IDS[object.type];
-    const bytes: number[] = [];
-    let first = true;
-    // varint: low 4 bits then 7 bits at a time, little-endian groups
-    let value = size;
-    let low = value & 0x0f;
-    value >>= 4;
-    while (value > 0) {
-      bytes.push((first ? (typeId << 4) | low : low) | 0x80);
-      low = value & 0x7f;
-      value >>= 7;
-      first = false;
+    // The entry header: the type in bits 4-6 of the first byte, then the size
+    // in 4 low bits and 7-bit little-endian groups while bytes remain.
+    const head: number[] = [];
+    let rest = object.data.length;
+    const low = rest & 0x0f;
+    rest >>= 4;
+    if (rest === 0) {
+      head.push((TYPE_IDS[object.type] << 4) | low);
+    } else {
+      head.push(((TYPE_IDS[object.type] << 4) | low) | 0x80);
+      while (rest > 0) {
+        const group = rest & 0x7f;
+        rest >>= 7;
+        head.push(rest > 0 ? group | 0x80 : group);
+      }
     }
-    bytes.push(first ? (typeId << 4) | low : low);
-    parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(object.data));
+    chunks.push(Buffer.from(head));
+    chunks.push(deflateSync(object.data, { level: 1 }));
   }
-  const body = Buffer.concat(parts);
+  const body = Buffer.concat(chunks);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
 }
 
 /**
- * Inflate the zlib stream starting at `offset`, finding its exact length.
- * inflateSync ignores trailing bytes after the stream's end, so the consumed
- * length is the shortest prefix that inflates without throwing (any shorter
- * prefix is missing the stream's final block and throws).
+ * Inflate the zlib stream that starts at `offset` and report how many input
+ * bytes it consumed. Asking the engine for its byte count makes this one pass;
+ * guessing prefix lengths would inflate the same bytes a dozen times over.
+ * Should an engine ever not report its byte count, fall back to probing
+ * prefixes (a doubling search, then a binary one) for the shortest length
+ * that inflates -- slower, but the same answer.
  */
 function inflateAt(buffer: Buffer, offset: number): { data: Buffer; consumed: number } {
+  if (offset >= buffer.length) throw new Error('inflate past the end of the pack');
+  try {
+    const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine?: { bytesWritten?: number };
+    };
+    const consumed = result.engine?.bytesWritten;
+    if (typeof consumed === 'number' && consumed > 0) {
+      return { data: result.buffer, consumed };
+    }
+  } catch {
+    // Not a readable stream here; the probe below reaches the same verdict.
+  }
   const max = buffer.length - offset;
-  if (max <= 0) throw new Error('inflate past the end of the pack');
   const attempt = (length: number): Buffer | null => {
     try {
       return inflateSync(buffer.subarray(offset, offset + length));
@@ -432,7 +518,6 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; consumed: nu
     data = attempt(hi);
   }
   if (data === null) throw new Error('corrupt zlib stream in pack');
-  // Binary search for the shortest working prefix in (hi/2, hi].
   let lo = Math.floor(hi / 2);
   while (lo + 1 < hi) {
     const mid = lo + Math.floor((hi - lo) / 2);
@@ -444,64 +529,65 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; consumed: nu
   return { data: exact, consumed: hi };
 }
 
-/** Apply a git delta (copy/insert program) to `base`. */
+/** Run a git delta program (copy/insert opcodes) over `base`. */
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let offset = 0;
+  let at = 0;
   const readVarint = (): number => {
     let value = 0;
     let shift = 0;
     for (;;) {
-      if (offset >= delta.length) throw new Error('delta varint overruns');
-      const byte = delta[offset]!;
-      offset += 1;
+      if (at >= delta.length) throw new Error('delta varint overruns');
+      const byte = delta[at]!;
+      at += 1;
       value |= (byte & 0x7f) << shift;
       shift += 7;
-      if ((byte & 0x80) === 0) break;
+      if ((byte & 0x80) === 0) return value;
     }
-    return value;
   };
   const sourceSize = readVarint();
   if (sourceSize !== base.length) throw new Error(`delta base size ${sourceSize} != ${base.length}`);
   const targetSize = readVarint();
-  const parts: Buffer[] = [];
+  const chunks: Buffer[] = [];
   let produced = 0;
-  while (offset < delta.length) {
-    const opcode = delta[offset]!;
-    offset += 1;
-    if (opcode & 0x80) {
-      let copyOffset = 0;
+  while (at < delta.length) {
+    const opcode = delta[at]!;
+    at += 1;
+    if ((opcode & 0x80) !== 0) {
+      let copyAt = 0;
       let copySize = 0;
-      if (opcode & 0x01) copyOffset |= delta[offset++]!;
-      if (opcode & 0x02) copyOffset |= delta[offset++]! << 8;
-      if (opcode & 0x04) copyOffset |= delta[offset++]! << 16;
-      if (opcode & 0x08) copyOffset |= delta[offset++]! << 24;
-      if (opcode & 0x10) copySize |= delta[offset++]!;
-      if (opcode & 0x20) copySize |= delta[offset++]! << 8;
-      if (opcode & 0x40) copySize |= delta[offset++]! << 16;
+      if (opcode & 0x01) copyAt |= delta[at++]!;
+      if (opcode & 0x02) copyAt |= delta[at++]! << 8;
+      if (opcode & 0x04) copyAt |= delta[at++]! << 16;
+      if (opcode & 0x08) copyAt |= delta[at++]! << 24;
+      if (opcode & 0x10) copySize |= delta[at++]!;
+      if (opcode & 0x20) copySize |= delta[at++]! << 8;
+      if (opcode & 0x40) copySize |= delta[at++]! << 16;
       if (copySize === 0) copySize = 0x10000;
-      parts.push(base.subarray(copyOffset, copyOffset + copySize));
+      chunks.push(base.subarray(copyAt, copyAt + copySize));
       produced += copySize;
     } else if (opcode > 0) {
-      parts.push(delta.subarray(offset, offset + opcode));
+      chunks.push(delta.subarray(at, at + opcode));
       produced += opcode;
-      offset += opcode;
+      at += opcode;
     } else {
       throw new Error('delta opcode 0 is reserved');
     }
   }
-  const out = Buffer.concat(parts);
+  const out = Buffer.concat(chunks);
   if (produced !== targetSize || out.length !== targetSize) throw new Error('delta produced the wrong size');
   return out;
 }
 
 export interface PackReadResult {
-  objects: GitObject[];
+  objects: KnownObject[];
   deltaCount: number;
 }
 
 /**
- * Parse a packfile fully, resolving deltas against objects in the same pack or, for a
- * thin pack, against `resolveBase`. Throws on any structural problem.
+ * Parse a packfile end to end, resolving deltas against entries in the same
+ * pack or, for a thin pack, against `resolveBase`. Every returned object
+ * carries the id it hashes to, computed once during resolution. Throws on any
+ * structural problem.
  */
 export function readPack(
   pack: Buffer,
@@ -512,95 +598,103 @@ export function readPack(
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`pack version ${version} unsupported`);
   const count = pack.readUInt32BE(8);
-  const trailer = pack.subarray(pack.length - 20);
   const digest = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest();
-  if (!trailer.equals(digest)) throw new Error('pack checksum mismatch');
+  if (!pack.subarray(pack.length - 20).equals(digest)) throw new Error('pack checksum mismatch');
   const end = pack.length - 20;
-  let offset = 12;
+
   interface RawEntry {
-    type: GitObjectType | 'ofs-delta' | 'ref-delta';
+    kind: GitObjectType | 'ofs-delta' | 'ref-delta';
     data: Buffer;
-    baseOffset?: number;
-    baseOid?: string;
     start: number;
+    baseOffset: number;
+    baseOid: string;
   }
   const raw: RawEntry[] = [];
-  const byOffset = new Map<number, number>();
+  const indexByOffset = new Map<number, number>();
+  const indexByOid = new Map<string, number>();
+  let at = 12;
   for (let index = 0; index < count; index += 1) {
-    const start = offset;
-    if (offset >= end) throw new Error('pack entry overruns');
-    let byte = pack[offset]!;
-    offset += 1;
+    const start = at;
+    if (at >= end) throw new Error('pack entry overruns');
+    let byte = pack[at]!;
+    at += 1;
     const typeId = (byte >> 4) & 0x07;
     let size = byte & 0x0f;
     let shift = 4;
-    while (byte & 0x80) {
-      byte = pack[offset]!;
-      offset += 1;
+    while ((byte & 0x80) !== 0) {
+      byte = pack[at]!;
+      at += 1;
       size |= (byte & 0x7f) << shift;
       shift += 7;
     }
-    const type = TYPE_NAMES[typeId];
-    if (type === undefined) throw new Error(`pack entry type ${typeId} unknown`);
-    const entry: RawEntry = { type, data: Buffer.alloc(0), start };
-    if (type === 'ofs-delta') {
-      let byteAt = pack[offset]!;
-      offset += 1;
-      let back = byteAt & 0x7f;
-      while (byteAt & 0x80) {
-        byteAt = pack[offset]!;
-        offset += 1;
-        back = ((back + 1) << 7) | (byteAt & 0x7f);
+    const kind = TYPE_NAMES[typeId];
+    if (kind === undefined) throw new Error(`pack entry type ${typeId} unknown`);
+    const entry: RawEntry = { kind, data: Buffer.alloc(0), start, baseOffset: -1, baseOid: '' };
+    if (kind === 'ofs-delta') {
+      let backByte = pack[at]!;
+      at += 1;
+      let back = backByte & 0x7f;
+      while ((backByte & 0x80) !== 0) {
+        backByte = pack[at]!;
+        at += 1;
+        back = ((back + 1) << 7) | (backByte & 0x7f);
       }
       entry.baseOffset = start - back;
-    } else if (type === 'ref-delta') {
-      entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
+    } else if (kind === 'ref-delta') {
+      entry.baseOid = pack.subarray(at, at + 20).toString('hex');
+      at += 20;
     }
-    const inflated = inflateAt(pack, offset);
+    const inflated = inflateAt(pack, at);
     if (inflated.data.length !== size) throw new Error('pack entry size mismatch');
     entry.data = inflated.data;
-    offset += inflated.consumed;
-    byOffset.set(start, raw.length);
+    at += inflated.consumed;
+    indexByOffset.set(start, raw.length);
     raw.push(entry);
   }
-  if (offset !== end) throw new Error('pack has trailing bytes before the trailer');
-  const resolved: Array<GitObject | null> = raw.map(() => null);
-  const resolvedOids: Array<string | null> = raw.map(() => null);
-  const resolve = (index: number): GitObject => {
-    const done = resolved[index];
-    if (done) return done;
+  if (at !== end) throw new Error('pack has trailing bytes before the trailer');
+
+  // Plain entries are identified up front: a REF delta may name any of them as
+  // its base, including one that sits later in the pack than the delta itself.
+  const resolved: Array<KnownObject | null> = raw.map(() => null);
+  for (let index = 0; index < raw.length; index += 1) {
     const entry = raw[index]!;
-    let object: GitObject;
-    if (entry.type === 'ofs-delta') {
-      const baseIndex = byOffset.get(entry.baseOffset!);
+    if (entry.kind !== 'ofs-delta' && entry.kind !== 'ref-delta') {
+      const object: KnownObject = { oid: hashObject(entry.kind, entry.data), type: entry.kind, data: entry.data };
+      resolved[index] = object;
+      indexByOid.set(object.oid, index);
+    }
+  }
+  const resolve = (index: number): KnownObject => {
+    const done = resolved[index];
+    if (done !== null) return done;
+    const entry = raw[index]!;
+    let object: KnownObject;
+    if (entry.kind === 'ofs-delta') {
+      const baseIndex = indexByOffset.get(entry.baseOffset);
       if (baseIndex === undefined) throw new Error('ofs-delta base not in pack');
       const base = resolve(baseIndex);
-      object = { type: base.type, data: applyDelta(base.data, entry.data) };
-    } else if (entry.type === 'ref-delta') {
+      const data = applyDelta(base.data, entry.data);
+      object = { oid: hashObject(base.type, data), type: base.type, data };
+    } else if (entry.kind === 'ref-delta') {
       let base: GitObject | undefined;
-      for (let candidate = 0; candidate < raw.length; candidate += 1) {
-        if (raw[candidate]!.type === 'ofs-delta' || raw[candidate]!.type === 'ref-delta') continue;
-        const candidateObject = resolve(candidate);
-        if (resolvedOids[candidate] === entry.baseOid) {
-          base = candidateObject;
-          break;
-        }
-      }
-      if (!base) base = resolveBase?.(entry.baseOid!);
-      if (!base) throw new Error(`ref-delta base ${entry.baseOid} unavailable`);
-      object = { type: base.type, data: applyDelta(base.data, entry.data) };
+      const baseIndex = indexByOid.get(entry.baseOid);
+      if (baseIndex !== undefined) base = resolve(baseIndex);
+      if (base === undefined) base = resolveBase?.(entry.baseOid);
+      if (base === undefined) throw new Error(`ref-delta base ${entry.baseOid} unavailable`);
+      const data = applyDelta(base.data, entry.data);
+      object = { oid: hashObject(base.type, data), type: base.type, data };
     } else {
-      object = { type: entry.type, data: entry.data };
+      // Plain entries were all resolved in the pass above.
+      throw new Error('unreachable: plain entry left unresolved');
     }
     resolved[index] = object;
-    resolvedOids[index] = hashObject(object.type, object.data);
     return object;
   };
-  const objects: GitObject[] = [];
+
+  const objects: KnownObject[] = [];
   let deltaCount = 0;
   for (let index = 0; index < raw.length; index += 1) {
-    if (raw[index]!.type === 'ofs-delta' || raw[index]!.type === 'ref-delta') deltaCount += 1;
+    if (raw[index]!.kind === 'ofs-delta' || raw[index]!.kind === 'ref-delta') deltaCount += 1;
     objects.push(resolve(index));
   }
   return { objects, deltaCount };

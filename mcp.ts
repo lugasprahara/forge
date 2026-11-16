@@ -1,10 +1,14 @@
-// The MCP endpoint (POST /mcp): JSON-RPC 2.0 over Streamable HTTP, speaking both
-// eras the suite accepts — the 2026-07-28 revision (server/discover, no handshake)
-// and the legacy initialize handshake. Tools act on the same store as REST, and
-// tools/list is a fixed array so two calls answer byte for byte.
+// mcp.ts -- the MCP endpoint (POST /mcp): JSON-RPC 2.0 over Streamable HTTP.
+//
+// It speaks both eras the suite accepts: the 2026-07-28 revision, where
+// server/discover answers without a handshake, and the legacy initialize /
+// notifications/initialized handshake. The tools act on the same store as
+// REST and GraphQL, so an object made over one surface reads back over the
+// others, ids unchanged. The tools/list answer comes from a fixed table, so
+// two calls return it byte for byte.
 
 import type { ServerResponse } from 'node:http';
-import { VIEWER, type Forge, type Repo } from './forge.ts';
+import { VIEWER, type Forge, type Issue, type Pull, type Repo } from './forge.ts';
 import { isRecord } from './webutil.ts';
 
 const SERVER_INFO = { name: 'forge', version: '1.0.0' };
@@ -16,19 +20,17 @@ interface ToolDef {
   inputSchema: Record<string, unknown>;
 }
 
+const STRING = { type: 'string' };
+
 function objectSchema(properties: Record<string, unknown>, required: string[]): Record<string, unknown> {
   return { type: 'object', properties, required, additionalProperties: false };
 }
 
-const STRING = { type: 'string' };
 const TOOLS: ToolDef[] = [
   {
     name: 'create_repo',
     description: 'Create a new repository owned by the authenticated user.',
-    inputSchema: objectSchema(
-      { name: STRING, description: STRING, private: { type: 'boolean' } },
-      ['name'],
-    ),
+    inputSchema: objectSchema({ name: STRING, description: STRING, private: { type: 'boolean' } }, ['name']),
   },
   {
     name: 'get_repo',
@@ -43,26 +45,17 @@ const TOOLS: ToolDef[] = [
   {
     name: 'create_issue',
     description: 'Create an issue in a repository.',
-    inputSchema: objectSchema(
-      { owner: STRING, repo: STRING, title: STRING, body: STRING },
-      ['owner', 'repo', 'title'],
-    ),
+    inputSchema: objectSchema({ owner: STRING, repo: STRING, title: STRING, body: STRING }, ['owner', 'repo', 'title']),
   },
   {
     name: 'list_issues',
     description: 'List the issues of a repository, optionally filtered by state (open, closed, all).',
-    inputSchema: objectSchema(
-      { owner: STRING, repo: STRING, state: STRING },
-      ['owner', 'repo'],
-    ),
+    inputSchema: objectSchema({ owner: STRING, repo: STRING, state: STRING }, ['owner', 'repo']),
   },
   {
     name: 'get_issue',
     description: 'Get one issue of a repository by its number.',
-    inputSchema: objectSchema(
-      { owner: STRING, repo: STRING, issue_number: { type: 'integer' } },
-      ['owner', 'repo', 'issue_number'],
-    ),
+    inputSchema: objectSchema({ owner: STRING, repo: STRING, issue_number: { type: 'integer' } }, ['owner', 'repo', 'issue_number']),
   },
   {
     name: 'create_pull_request',
@@ -84,6 +77,24 @@ const TOOLS: ToolDef[] = [
 
 const TOOLS_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
 
+/**
+ * Find a tool by the name a caller used. An exact match wins; otherwise the
+ * name is matched as a suffix, case-insensitively, so a client that prefixes
+ * its tool names (github__create_issue) still lands on the same tool.
+ */
+function findTool(name: string): ToolDef | undefined {
+  const exact = TOOLS_BY_NAME.get(name);
+  if (exact !== undefined) return exact;
+  const wanted = name.toLowerCase();
+  for (const tool of TOOLS) {
+    if (wanted === tool.name || wanted.endsWith(`__${tool.name}`)) return tool;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// tool views and execution
+
 function repoView(repo: Repo): Record<string, unknown> {
   return {
     id: repo.id,
@@ -97,7 +108,7 @@ function repoView(repo: Repo): Record<string, unknown> {
   };
 }
 
-function issueView(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: string[] }): Record<string, unknown> {
+function issueView(repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
     number: issue.number,
@@ -109,8 +120,8 @@ function issueView(repo: Repo, issue: { id: number; number: number; title: strin
   };
 }
 
-function pullView(forge: Forge, repo: Repo, pull: { id: number; number: number; title: string; body: string; headRef: string; baseRef: string; state: string; merged: boolean }): Record<string, unknown> {
-  const { head, base } = forge.pullTips(repo, pull as never);
+function pullView(forge: Forge, repo: Repo, pull: Pull): Record<string, unknown> {
+  const { head, base } = forge.pullTips(repo, pull);
   return {
     id: pull.id,
     number: pull.number,
@@ -123,10 +134,7 @@ function pullView(forge: Forge, repo: Repo, pull: { id: number; number: number; 
   };
 }
 
-interface ToolOutcome {
-  view: unknown;
-}
-
+/** A tool failure the caller hears about as an isError result, not a crash. */
 class ToolFailure extends Error {}
 
 function requiredString(args: Record<string, unknown>, key: string): string {
@@ -143,30 +151,33 @@ function repoOf(forge: Forge, args: Record<string, unknown>): Repo {
   return repo;
 }
 
-function runTool(forge: Forge, name: string, args: Record<string, unknown>): ToolOutcome {
-  switch (name) {
+function runTool(forge: Forge, tool: ToolDef, args: Record<string, unknown>): unknown {
+  switch (tool.name) {
     case 'create_repo': {
-      const repoName = requiredString(args, 'name');
-      if (forge.getRepo(VIEWER.login, repoName) !== null) throw new ToolFailure(`repository ${repoName} already exists`);
+      const name = requiredString(args, 'name');
+      if (forge.getRepo(VIEWER.login, name) !== null) {
+        throw new ToolFailure(`repository ${name} already exists`);
+      }
       const repo = forge.createRepo(
-        repoName,
+        name,
         args.private === true,
         typeof args.description === 'string' ? args.description : '',
       );
-      return { view: repoView(repo) };
+      return repoView(repo);
     }
-    case 'get_repo': {
-      return { view: repoView(repoOf(forge, args)) };
-    }
-    case 'list_repos': {
-      return { view: forge.listRepos().map(repoView) };
-    }
+    case 'get_repo':
+      return repoView(repoOf(forge, args));
+    case 'list_repos':
+      return forge.listRepos().map(repoView);
     case 'create_issue': {
       const repo = repoOf(forge, args);
-      const title = requiredString(args, 'title');
-      const body = typeof args.body === 'string' ? args.body : '';
-      const issue = forge.createIssue(repo, title, body, []);
-      return { view: issueView(repo, issue) };
+      const issue = forge.createIssue(
+        repo,
+        requiredString(args, 'title'),
+        typeof args.body === 'string' ? args.body : '',
+        [],
+      );
+      return issueView(repo, issue);
     }
     case 'list_issues': {
       const repo = repoOf(forge, args);
@@ -175,14 +186,14 @@ function runTool(forge: Forge, name: string, args: Record<string, unknown>): Too
       if (state === 'open') issues = issues.filter((issue) => issue.state === 'open');
       else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
       issues.sort((a, b) => a.number - b.number);
-      return { view: issues.map((issue) => issueView(repo, issue)) };
+      return issues.map((issue) => issueView(repo, issue));
     }
     case 'get_issue': {
       const repo = repoOf(forge, args);
       const number = typeof args.issue_number === 'number' ? args.issue_number : Number(args.number);
       const issue = repo.issues.get(number);
       if (issue === undefined) throw new ToolFailure(`issue ${number} not found`);
-      return { view: issueView(repo, issue) };
+      return issueView(repo, issue);
     }
     case 'create_pull_request': {
       const repo = repoOf(forge, args);
@@ -192,7 +203,7 @@ function runTool(forge: Forge, name: string, args: Record<string, unknown>): Too
       if (forge.branchTip(repo, head) === null) throw new ToolFailure(`head branch ${head} does not exist`);
       if (forge.branchTip(repo, base) === null) throw new ToolFailure(`base branch ${base} does not exist`);
       const pull = forge.createPull(repo, title, typeof args.body === 'string' ? args.body : '', head, base);
-      return { view: pullView(forge, repo, pull) };
+      return pullView(forge, repo, pull);
     }
     case 'merge_pull_request': {
       const repo = repoOf(forge, args);
@@ -208,10 +219,10 @@ function runTool(forge: Forge, name: string, args: Record<string, unknown>): Too
         pull.mergeCommitSha = sha;
         pull.updatedAt = pull.mergedAt;
       }
-      return { view: pullView(forge, repo, pull) };
+      return pullView(forge, repo, pull);
     }
     default:
-      throw new ToolFailure(`unknown tool ${name}`);
+      throw new ToolFailure(`unknown tool ${tool.name}`);
   }
 }
 
@@ -235,7 +246,7 @@ function sendRpcError(res: ServerResponse, status: number, id: unknown, code: nu
   sendRpc(res, status, { jsonrpc: '2.0', id, error: { code, message } });
 }
 
-/** Handle one POST /mcp. Auth is enforced by the caller (401 before we run). */
+/** Handle one POST /mcp; the caller has already enforced the bearer token. */
 export function handleMcp(forge: Forge, body: Buffer, res: ServerResponse): void {
   let parsed: unknown;
   try {
@@ -245,16 +256,17 @@ export function handleMcp(forge: Forge, body: Buffer, res: ServerResponse): void
     return;
   }
   if (Array.isArray(parsed)) {
-    // JSON-RPC batching is not part of the suite's contract; answer per entry anyway.
-    const responses = parsed.map((entry) => handleOne(forge, entry));
-    const text = JSON.stringify(responses.filter((entry) => entry !== null));
+    const answers = parsed
+      .map((entry) => handleOne(forge, entry))
+      .filter((entry) => entry !== null);
+    const text = JSON.stringify(answers);
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
     res.end(text);
     return;
   }
   const response = handleOne(forge, parsed);
   if (response === null) {
-    // A notification: accepted, no body.
+    // A notification: taken, with no body to answer.
     res.writeHead(202, { 'content-length': 0 });
     res.end();
     return;
@@ -266,17 +278,15 @@ function handleOne(forge: Forge, entry: unknown): RpcResponse | null {
   if (!isRecord(entry) || typeof entry.method !== 'string') {
     return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
   }
-  const method = entry.method;
   const id = 'id' in entry ? entry.id : undefined;
   const isNotification = id === undefined;
   const params = isRecord(entry.params) ? entry.params : {};
-
   const result = (value: unknown): RpcResponse | null =>
     isNotification ? null : { jsonrpc: '2.0', id, result: value };
   const failure = (code: number, message: string): RpcResponse | null =>
     isNotification ? null : { jsonrpc: '2.0', id, error: { code, message } };
 
-  switch (method) {
+  switch (entry.method) {
     case 'server/discover':
       return result({
         resultType: 'complete',
@@ -288,11 +298,7 @@ function handleOne(forge: Forge, entry: unknown): RpcResponse | null {
     case 'initialize': {
       const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
       const chosen = SUPPORTED_VERSIONS.includes(requested) ? requested : '2025-11-25';
-      return result({
-        protocolVersion: chosen,
-        capabilities: { tools: {} },
-        serverInfo: SERVER_INFO,
-      });
+      return result({ protocolVersion: chosen, capabilities: { tools: {} }, serverInfo: SERVER_INFO });
     }
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -303,28 +309,24 @@ function handleOne(forge: Forge, entry: unknown): RpcResponse | null {
       return result({ tools: TOOLS });
     case 'tools/call': {
       const name = typeof params.name === 'string' ? params.name : '';
-      const tool = TOOLS_BY_NAME.get(name);
+      const tool = findTool(name);
       if (tool === undefined) return failure(-32602, `unknown tool: ${name}`);
       const args = isRecord(params.arguments) ? params.arguments : {};
       try {
-        const outcome = runTool(forge, name, args);
-        const text = JSON.stringify(outcome.view);
+        const view = runTool(forge, tool, args);
         return result({
-          content: [{ type: 'text', text }],
-          structuredContent: outcome.view,
+          content: [{ type: 'text', text: JSON.stringify(view) }],
+          structuredContent: view,
           isError: false,
         });
       } catch (err) {
         if (err instanceof ToolFailure) {
-          return result({
-            content: [{ type: 'text', text: err.message }],
-            isError: true,
-          });
+          return result({ content: [{ type: 'text', text: err.message }], isError: true });
         }
         throw err;
       }
     }
     default:
-      return failure(-32601, `method not found: ${method}`);
+      return failure(-32601, `method not found: ${entry.method}`);
   }
 }

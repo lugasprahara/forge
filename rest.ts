@@ -1,7 +1,11 @@
-// The REST v3 surface, shaped the way checks-rest.ts and rest-client.ts exercise it:
-// repos CRUD with Link-header pagination, git refs, branches, commits, the contents
-// API (which builds real commits on the object store), labels, issues + comments,
-// and pull requests with a real squash merge.
+// rest.ts -- the REST v3 surface: repositories with Link-header pagination, git
+// refs and branches, commit listing, the contents API (whose writes are real
+// commits on the object store), labels, issues with comments, and pull
+// requests with a squash merge.
+//
+// The read and write benchmark workloads hammer two routes here -- GET one
+// issue, POST one issue -- so the issue paths build their replies directly
+// from the stored records with no detours.
 
 import type { ServerResponse } from 'node:http';
 import { ZERO_OID, peelToCommit } from './gitcore.ts';
@@ -16,14 +20,18 @@ import { isRecord, sendError, sendJson, stringField } from './webutil.ts';
 
 export interface RestRequest {
   method: string;
-  /** Path segments after /api/v3, percent-decoded. */
+  /** Path segments after /api/v3, already percent-decoded. */
   segments: string[];
   query: URLSearchParams;
   body: unknown;
-  /** Absolute origin of this server, for Link headers. */
+  /** This server's absolute origin, for Link headers. */
   origin: string;
+  /** The request path, for Link headers. */
   path: string;
 }
+
+// ---------------------------------------------------------------------------
+// JSON shapes
 
 function userJson(): Record<string, unknown> {
   return {
@@ -126,15 +134,16 @@ function pullJson(forge: Forge, repo: Repo, pull: Pull): Record<string, unknown>
   };
 }
 
+/** An author/committer line ("Name <mail> ts tz") as the API's date shape. */
 function parseAuthorLine(line: string): { name: string; email: string; date: string } {
   const match = /^(.*?) <(.*?)> (\d+) [+-]\d{4}$/.exec(line);
-  if (!match) return { name: line, email: '', date: new Date(0).toISOString() };
+  if (match === null) return { name: line, email: '', date: new Date(0).toISOString() };
   return { name: match[1]!, email: match[2]!, date: new Date(Number(match[3]) * 1000).toISOString() };
 }
 
 function commitJson(forge: Forge, oid: string): Record<string, unknown> | null {
   const commit = forge.store.commit(oid);
-  if (!commit) return null;
+  if (commit === null) return null;
   return {
     sha: oid,
     node_id: `commit-${oid}`,
@@ -153,17 +162,20 @@ function commitJson(forge: Forge, oid: string): Record<string, unknown> | null {
   };
 }
 
+// ---------------------------------------------------------------------------
+// pagination
+
 interface Page {
   perPage: number;
   page: number;
 }
 
-function pageOf(query: URLSearchParams, defaultPerPage = 30): Page {
-  const perPageRaw = Number(query.get('per_page') ?? defaultPerPage);
-  const pageRaw = Number(query.get('page') ?? 1);
+function pageOf(query: URLSearchParams, fallbackPerPage = 30): Page {
+  const perPage = Number(query.get('per_page') ?? fallbackPerPage);
+  const page = Number(query.get('page') ?? 1);
   return {
-    perPage: Number.isFinite(perPageRaw) && perPageRaw > 0 ? Math.min(100, Math.floor(perPageRaw)) : defaultPerPage,
-    page: Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1,
+    perPage: Number.isFinite(perPage) && perPage > 0 ? Math.min(100, Math.floor(perPage)) : fallbackPerPage,
+    page: Number.isFinite(page) && page > 0 ? Math.floor(page) : 1,
   };
 }
 
@@ -172,19 +184,17 @@ function pageSlice<T>(items: T[], page: Page): T[] {
   return items.slice(start, start + page.perPage);
 }
 
-/** A Link header with rel="next" while more pages remain (same origin, params kept). */
+/** A Link header naming the next (and last) page while pages remain. */
 function linkHeader(req: RestRequest, total: number, page: Page): Record<string, string> {
   if (page.page * page.perPage >= total) return {};
-  const params = new URLSearchParams(req.query);
-  params.set('per_page', String(page.perPage));
-  params.set('page', String(page.page + 1));
+  const withPage = (target: number): string => {
+    const params = new URLSearchParams(req.query);
+    params.set('per_page', String(page.perPage));
+    params.set('page', String(target));
+    return `<${req.origin}${req.path}?${params.toString()}>`;
+  };
   const lastPage = Math.max(1, Math.ceil(total / page.perPage));
-  const lastParams = new URLSearchParams(req.query);
-  lastParams.set('per_page', String(page.perPage));
-  lastParams.set('page', String(lastPage));
-  const next = `<${req.origin}${req.path}?${params.toString()}>; rel="next"`;
-  const last = `<${req.origin}${req.path}?${lastParams.toString()}>; rel="last"`;
-  return { link: `${next}, ${last}` };
+  return { link: `${withPage(page.page + 1)}; rel="next", ${withPage(lastPage)}; rel="last"` };
 }
 
 function notFound(res: ServerResponse): void {
@@ -196,11 +206,11 @@ function unprocessable(res: ServerResponse, message: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// routing
 
 export function handleRest(forge: Forge, req: RestRequest, res: ServerResponse): void {
   const { method, segments } = req;
 
-  // API root and meta.
   if (segments.length === 0) {
     if (method === 'GET') {
       sendJson(
@@ -213,9 +223,9 @@ export function handleRest(forge: Forge, req: RestRequest, res: ServerResponse):
         },
         { 'x-oauth-scopes': 'repo, read:org' },
       );
-      return;
+    } else {
+      notFound(res);
     }
-    notFound(res);
     return;
   }
   if (segments[0] === 'meta' && segments.length === 1 && method === 'GET') {
@@ -226,51 +236,48 @@ export function handleRest(forge: Forge, req: RestRequest, res: ServerResponse):
     sendJson(res, 200, userJson());
     return;
   }
-
-  // The viewer's repositories.
   if (segments[0] === 'user' && segments[1] === 'repos' && segments.length === 2) {
-    if (method === 'POST') {
-      if (!isRecord(req.body)) return unprocessable(res, 'Invalid request');
-      const name = stringField(req.body, 'name');
-      if (name === null || name === '') return unprocessable(res, 'name is required');
-      if (forge.getRepo(VIEWER.login, name) !== null) {
-        return unprocessable(res, 'name already exists on this account');
-      }
-      const isPrivate = req.body.private === true;
-      const description = stringField(req.body, 'description') ?? '';
-      const repo = forge.createRepo(name, isPrivate, description);
-      sendJson(res, 201, repoJson(repo));
-      return;
-    }
-    if (method === 'GET') {
-      const all = forge.listRepos();
-      const page = pageOf(req.query);
-      sendJson(res, 200, pageSlice(all, page).map(repoJson), linkHeader(req, all.length, page));
-      return;
-    }
-    notFound(res);
+    handleViewerRepos(forge, req, res);
     return;
   }
-
   if (segments[0] !== 'repos' || segments.length < 3) {
     notFound(res);
     return;
   }
-  const owner = segments[1]!;
-  const repoName = segments[2]!;
-  const repo = forge.getRepo(owner, repoName);
+  const repo = forge.getRepo(segments[1]!, segments[2]!);
   if (repo === null) {
     notFound(res);
     return;
   }
-  const rest = segments.slice(3);
-  handleRepoRest(forge, req, res, repo, rest);
+  handleRepoRest(forge, req, res, repo, segments.slice(3));
+}
+
+function handleViewerRepos(forge: Forge, req: RestRequest, res: ServerResponse): void {
+  if (req.method === 'POST') {
+    if (!isRecord(req.body)) return unprocessable(res, 'Invalid request');
+    const name = stringField(req.body, 'name');
+    if (name === null || name === '') return unprocessable(res, 'name is required');
+    if (forge.getRepo(VIEWER.login, name) !== null) {
+      return unprocessable(res, 'name already exists on this account');
+    }
+    const repo = forge.createRepo(
+      name,
+      req.body.private === true,
+      stringField(req.body, 'description') ?? '',
+    );
+    return sendJson(res, 201, repoJson(repo));
+  }
+  if (req.method === 'GET') {
+    const all = forge.listRepos();
+    const page = pageOf(req.query);
+    return sendJson(res, 200, pageSlice(all, page).map(repoJson), linkHeader(req, all.length, page));
+  }
+  return notFound(res);
 }
 
 function handleRepoRest(forge: Forge, req: RestRequest, res: ServerResponse, repo: Repo, rest: string[]): void {
   const { method } = req;
 
-  // The repository itself.
   if (rest.length === 0) {
     if (method === 'GET') return sendJson(res, 200, repoJson(repo));
     if (method === 'PATCH') {
@@ -299,14 +306,26 @@ function handleRepoRest(forge: Forge, req: RestRequest, res: ServerResponse, rep
     return notFound(res);
   }
 
-  if (rest[0] === 'branches') return handleBranches(forge, req, res, repo, rest.slice(1));
-  if (rest[0] === 'git' && rest[1] === 'refs') return handleGitRefs(forge, req, res, repo, rest.slice(2));
-  if (rest[0] === 'commits' && rest.length === 1) return handleCommits(forge, req, res, repo);
-  if (rest[0] === 'contents') return handleContents(forge, req, res, repo, rest.slice(1).join('/'));
-  if (rest[0] === 'labels') return handleLabels(forge, req, res, repo, rest.slice(1));
-  if (rest[0] === 'issues') return handleIssues(forge, req, res, repo, rest.slice(1));
-  if (rest[0] === 'pulls') return handlePulls(forge, req, res, repo, rest.slice(1));
-  notFound(res);
+  switch (rest[0]) {
+    case 'branches':
+      return handleBranches(forge, req, res, repo, rest.slice(1));
+    case 'git':
+      if (rest[1] === 'refs') return handleGitRefs(forge, req, res, repo, rest.slice(2));
+      return notFound(res);
+    case 'commits':
+      if (rest.length === 1) return handleCommits(forge, req, res, repo);
+      return notFound(res);
+    case 'contents':
+      return handleContents(forge, req, res, repo, rest.slice(1).join('/'));
+    case 'labels':
+      return handleLabels(forge, req, res, repo, rest.slice(1));
+    case 'issues':
+      return handleIssues(forge, req, res, repo, rest.slice(1));
+    case 'pulls':
+      return handlePulls(forge, req, res, repo, rest.slice(1));
+    default:
+      return notFound(res);
+  }
 }
 
 function handleBranches(forge: Forge, req: RestRequest, res: ServerResponse, repo: Repo, rest: string[]): void {
@@ -316,17 +335,15 @@ function handleBranches(forge: Forge, req: RestRequest, res: ServerResponse, rep
       commit: { sha: repo.refs.get(`refs/heads/${name}`)!, url: '' },
       protected: false,
     }));
-    sendJson(res, 200, branches);
-    return;
+    return sendJson(res, 200, branches);
   }
   if (req.method === 'GET' && rest.length >= 1) {
     const name = rest.join('/');
     const tip = forge.branchTip(repo, name);
     if (tip === null) return notFound(res);
-    sendJson(res, 200, { name, commit: { sha: tip, url: '' }, protected: false });
-    return;
+    return sendJson(res, 200, { name, commit: { sha: tip, url: '' }, protected: false });
   }
-  notFound(res);
+  return notFound(res);
 }
 
 function handleGitRefs(forge: Forge, req: RestRequest, res: ServerResponse, repo: Repo, rest: string[]): void {
@@ -340,15 +357,18 @@ function handleGitRefs(forge: Forge, req: RestRequest, res: ServerResponse, repo
     if (repo.refs.has(ref)) return unprocessable(res, 'Reference already exists');
     repo.refs.set(ref, sha);
     const object = forge.store.get(sha)!;
-    sendJson(res, 201, { ref, node_id: `ref-${ref}`, url: '', object: { type: object.type, sha } });
-    return;
+    return sendJson(res, 201, { ref, node_id: `ref-${ref}`, url: '', object: { type: object.type, sha } });
   }
   if (req.method === 'GET' && rest.length === 0) {
     const all = [...repo.refs.entries()]
       .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-      .map(([ref, sha]) => ({ ref, node_id: `ref-${ref}`, url: '', object: { type: forge.store.get(sha)?.type ?? 'commit', sha } }));
-    sendJson(res, 200, all);
-    return;
+      .map(([ref, sha]) => ({
+        ref,
+        node_id: `ref-${ref}`,
+        url: '',
+        object: { type: forge.store.get(sha)?.type ?? 'commit', sha },
+      }));
+    return sendJson(res, 200, all);
   }
   if ((req.method === 'GET' || req.method === 'DELETE') && rest.length >= 1) {
     const ref = `refs/${rest.join('/')}`;
@@ -361,10 +381,9 @@ function handleGitRefs(forge: Forge, req: RestRequest, res: ServerResponse, repo
       return;
     }
     const object = forge.store.get(sha);
-    sendJson(res, 200, { ref, node_id: `ref-${ref}`, url: '', object: { type: object?.type ?? 'commit', sha } });
-    return;
+    return sendJson(res, 200, { ref, node_id: `ref-${ref}`, url: '', object: { type: object?.type ?? 'commit', sha } });
   }
-  notFound(res);
+  return notFound(res);
 }
 
 function handleCommits(forge: Forge, req: RestRequest, res: ServerResponse, repo: Repo): void {
@@ -379,7 +398,7 @@ function handleCommits(forge: Forge, req: RestRequest, res: ServerResponse, repo
   const items = pageSlice(all, page)
     .map((oid) => commitJson(forge, oid))
     .filter((entry) => entry !== null);
-  sendJson(res, 200, items, linkHeader(req, all.length, page));
+  return sendJson(res, 200, items, linkHeader(req, all.length, page));
 }
 
 // ---------------------------------------------------------------------------
@@ -387,12 +406,11 @@ function handleCommits(forge: Forge, req: RestRequest, res: ServerResponse, repo
 
 function fileJson(forge: Forge, path: string, blobOid: string): Record<string, unknown> {
   const data = forge.store.get(blobOid)?.data ?? Buffer.alloc(0);
-  const name = path.split('/').pop() ?? path;
   return {
     type: 'file',
     encoding: 'base64',
     size: data.length,
-    name,
+    name: path.split('/').pop() ?? path,
     path,
     content: data.toString('base64'),
     sha: blobOid,
@@ -402,8 +420,22 @@ function fileJson(forge: Forge, path: string, blobOid: string): Record<string, u
   };
 }
 
+function dirEntryJson(forge: Forge, entry: { mode: string; name: string; oid: string }, base: string): Record<string, unknown> {
+  const isDir = entry.mode === '40000';
+  return {
+    type: isDir ? 'dir' : 'file',
+    name: entry.name,
+    path: base === '' ? entry.name : `${base}/${entry.name}`,
+    sha: entry.oid,
+    size: isDir ? 0 : (forge.store.get(entry.oid)?.data.length ?? 0),
+    url: '',
+    html_url: '',
+  };
+}
+
 function handleContents(forge: Forge, req: RestRequest, res: ServerResponse, repo: Repo, rawPath: string): void {
   const path = rawPath.replace(/^\/+|\/+$/g, '');
+
   if (req.method === 'GET') {
     const refParam = req.query.get('ref');
     const commit = refParam !== null && refParam !== ''
@@ -418,20 +450,17 @@ function handleContents(forge: Forge, req: RestRequest, res: ServerResponse, rep
     const blob = forge.blobAtPath(tree, path);
     if (blob !== null) return sendJson(res, 200, fileJson(forge, path, blob));
     const dir = forge.dirEntries(tree, path);
-    if (dir !== null) {
-      return sendJson(res, 200, dir.map((entry) => dirEntryJson(forge, entry, path)));
-    }
+    if (dir !== null) return sendJson(res, 200, dir.map((entry) => dirEntryJson(forge, entry, path)));
     return notFound(res);
   }
 
   if (req.method === 'PUT') {
     if (!isRecord(req.body)) return unprocessable(res, 'Invalid request');
-    const message = stringField(req.body, 'message') ?? 'update';
     const content = stringField(req.body, 'content');
     if (content === null) return unprocessable(res, 'content is required');
+    const message = stringField(req.body, 'message') ?? 'update';
     const branch = stringField(req.body, 'branch') ?? repo.defaultBranch;
-    const data = Buffer.from(content.replace(/\s+/g, ''), 'base64');
-    const blobOid = forge.store.add('blob', data);
+    const blobOid = forge.store.add('blob', Buffer.from(content.replace(/\s+/g, ''), 'base64'));
     const branchTip = forge.branchTip(repo, branch);
     const branchCommit = branchTip === null ? null : peelToCommit(forge.store, branchTip);
     const existing = branchCommit === null
@@ -442,8 +471,7 @@ function handleContents(forge: Forge, req: RestRequest, res: ServerResponse, rep
       return sendError(res, 409, `${path} has changed since the sha was read`);
     }
     const { commitOid } = forge.commitFileChange(repo, branch, path, blobOid, message);
-    const status = existing !== null ? 200 : 201;
-    return sendJson(res, status, {
+    return sendJson(res, existing !== null ? 200 : 201, {
       content: fileJson(forge, path, blobOid),
       commit: commitJson(forge, commitOid) ?? { sha: commitOid },
     });
@@ -466,14 +494,7 @@ function handleContents(forge: Forge, req: RestRequest, res: ServerResponse, rep
     return sendJson(res, 200, { content: null, commit: commitJson(forge, commitOid) ?? { sha: commitOid } });
   }
 
-  notFound(res);
-}
-
-function dirEntryJson(forge: Forge, entry: { mode: string; name: string; oid: string }, base: string): Record<string, unknown> {
-  const path = base === '' ? entry.name : `${base}/${entry.name}`;
-  const isDir = entry.mode === '40000';
-  const size = isDir ? 0 : (forge.store.get(entry.oid)?.data.length ?? 0);
-  return { type: isDir ? 'dir' : 'file', name: entry.name, path, sha: entry.oid, size, url: '', html_url: '' };
+  return notFound(res);
 }
 
 // ---------------------------------------------------------------------------
@@ -493,11 +514,22 @@ function handleLabels(forge: Forge, req: RestRequest, res: ServerResponse, repo:
     repo.labels.set(name, { name, color });
     return sendJson(res, 201, { id: forge.nextEntityId(), ...labelJson(name, color) });
   }
-  notFound(res);
+  return notFound(res);
 }
 
 // ---------------------------------------------------------------------------
 // issues
+
+/** Label names out of a request value: strings, or objects carrying a name. */
+function labelNamesOf(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const names: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === 'string') names.push(entry);
+    else if (isRecord(entry) && typeof entry.name === 'string') names.push(entry.name);
+  }
+  return names;
+}
 
 function handleIssues(forge: Forge, req: RestRequest, res: ServerResponse, repo: Repo, rest: string[]): void {
   if (rest.length === 0) {
@@ -506,8 +538,8 @@ function handleIssues(forge: Forge, req: RestRequest, res: ServerResponse, repo:
       let items = [...repo.issues.values()];
       if (state === 'open') items = items.filter((issue) => issue.state === 'open');
       else if (state === 'closed') items = items.filter((issue) => issue.state === 'closed');
-      const direction = req.query.get('direction') ?? 'desc';
-      items.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
+      const ascending = (req.query.get('direction') ?? 'desc') === 'asc';
+      items.sort((a, b) => (ascending ? a.seq - b.seq : b.seq - a.seq));
       const page = pageOf(req.query);
       return sendJson(res, 200, pageSlice(items, page).map((issue) => issueJson(repo, issue)), linkHeader(req, items.length, page));
     }
@@ -515,12 +547,11 @@ function handleIssues(forge: Forge, req: RestRequest, res: ServerResponse, repo:
       if (!isRecord(req.body)) return unprocessable(res, 'Invalid request');
       const title = stringField(req.body, 'title');
       if (title === null || title === '') return unprocessable(res, 'title is required');
-      const body = stringField(req.body, 'body') ?? '';
       const labels = labelNamesOf(req.body.labels);
       for (const label of labels) {
         if (!repo.labels.has(label)) return unprocessable(res, `label "${label}" does not exist`);
       }
-      const issue = forge.createIssue(repo, title, body, labels);
+      const issue = forge.createIssue(repo, title, stringField(req.body, 'body') ?? '', labels);
       return sendJson(res, 201, issueJson(repo, issue));
     }
     return notFound(res);
@@ -557,9 +588,7 @@ function handleIssues(forge: Forge, req: RestRequest, res: ServerResponse, repo:
 
   if (rest.length === 2 && rest[1] === 'comments') {
     if (issue === undefined) return notFound(res);
-    if (req.method === 'GET') {
-      return sendJson(res, 200, issue.comments.map(commentJson));
-    }
+    if (req.method === 'GET') return sendJson(res, 200, issue.comments.map(commentJson));
     if (req.method === 'POST') {
       if (!isRecord(req.body)) return unprocessable(res, 'Invalid request');
       const body = stringField(req.body, 'body');
@@ -582,17 +611,7 @@ function handleIssues(forge: Forge, req: RestRequest, res: ServerResponse, repo:
     return sendJson(res, 200, issue.labels.map((name) => labelJson(name, repo.labels.get(name)?.color ?? 'ededed')));
   }
 
-  notFound(res);
-}
-
-function labelNamesOf(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const names: string[] = [];
-  for (const entry of value) {
-    if (typeof entry === 'string') names.push(entry);
-    else if (isRecord(entry) && typeof entry.name === 'string') names.push(entry.name);
-  }
-  return names;
+  return notFound(res);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,8 +630,6 @@ function handlePulls(forge: Forge, req: RestRequest, res: ServerResponse, repo: 
     }
     if (req.method === 'POST') {
       if (!isRecord(req.body)) return unprocessable(res, 'Invalid request');
-      const title = stringField(req.body, 'title') ?? '';
-      const body = stringField(req.body, 'body') ?? '';
       const head = stringField(req.body, 'head');
       const base = stringField(req.body, 'base');
       if (head === null || base === null) return unprocessable(res, 'head and base are required');
@@ -624,7 +641,13 @@ function handlePulls(forge: Forge, req: RestRequest, res: ServerResponse, repo: 
       if (duplicate !== undefined) {
         return unprocessable(res, `A pull request already exists for ${head} into ${base}`);
       }
-      const pull = forge.createPull(repo, title, body, head, base);
+      const pull = forge.createPull(
+        repo,
+        stringField(req.body, 'title') ?? '',
+        stringField(req.body, 'body') ?? '',
+        head,
+        base,
+      );
       return sendJson(res, 201, pullJson(forge, repo, pull));
     }
     return notFound(res);
@@ -665,8 +688,9 @@ function handlePulls(forge: Forge, req: RestRequest, res: ServerResponse, repo: 
   }
 
   if (rest.length === 2 && rest[1] === 'merge' && req.method === 'PUT') {
-    if (pull.merged) return sendError(res, 405, 'Pull Request is not mergeable');
-    if (pull.state !== 'open') return sendError(res, 405, 'Pull Request is not mergeable');
+    if (pull.merged || pull.state !== 'open') {
+      return sendError(res, 405, 'Pull Request is not mergeable');
+    }
     const sha = forge.mergePull(repo, pull);
     if (sha === null) return sendError(res, 405, 'Pull Request is not mergeable');
     pull.merged = true;
@@ -677,5 +701,5 @@ function handlePulls(forge: Forge, req: RestRequest, res: ServerResponse, repo: 
     return sendJson(res, 200, { sha, merged: true, message: 'Pull Request successfully merged' });
   }
 
-  notFound(res);
+  return notFound(res);
 }

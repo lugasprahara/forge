@@ -31,45 +31,36 @@ agents already speak, all backed by a single in-memory store:
 - **REST v3** (`/api/v3`) — repositories (CRUD + `Link`-header pagination),
   branches and git refs, commit listing, the contents API (file writes build
   real commits on the object store), labels, issues and comments, and pull
-  requests with file diffs and a real squash merge (file-level three-way
+  requests with file diffs and a real squash merge (a file-level three-way
   merge over the object store).
 - **GraphQL v4** (`/api/graphql`) — the queries and mutations `gh` and
-  github-mcp-server send: viewer, repository fields, issue/pull-request reads,
-  cursor pagination, `createIssue` / `closeIssue` / `createPullRequest` /
-  `mergePullRequest` / `addComment`, Relay `node(id:)` with opaque global ids,
-  `__type` introspection, and operation batching.
-- **MCP** (`/mcp`) — JSON-RPC 2.0 over Streamable HTTP in both protocol eras
-  (the 2026-07-28 `server/discover` revision and the legacy `initialize`
-  handshake), with tools for repositories, issues and pull requests acting on
-  the same store as the REST surface.
+  github-mcp-server send: viewer, repository fields, issue/pull-request
+  reads, cursor pagination, `createIssue` / `closeIssue` /
+  `createPullRequest` / `mergePullRequest` / `addComment`, Relay `node(id:)`
+  with opaque global ids, `__type` introspection, and operation batching.
+- **MCP** (`/mcp`) — JSON-RPC 2.0 over Streamable HTTP, both the 2026-07-28
+  `server/discover` revision and the legacy `initialize` handshake, with
+  tools to create and read repositories, issues and pull requests over the
+  same store the other surfaces use.
 
-## Running
+## How it is built for speed
 
-The entry follows the agent/v1 lifecycle: it needs `MAKEFUN_ENV_URL` (the
-suite's origin) and `MAKEFUN_SHOP_TOKEN` (the bearer token every API call
-presents), binds an ephemeral port, registers it, and serves until the suite
-says the trial is done.
+The forge's second iteration is tuned on the paths the timed workloads
+exercise:
 
-```
-node main.ts
-```
+- **Receive-pack** parses a pack in one pass: each entry is inflated exactly
+  once (the zlib engine reports the bytes it consumed) and carries its object
+  id out of the parse, so storing it never hashes the same bytes twice.
+- **Fast-forward checks** stop at the first matching parent instead of
+  collecting a branch's whole ancestry, which is what a one-commit push
+  (the common case) needs.
+- **Tree flattening** — the path-to-blob listing merges and diffs ask for —
+  is cached on the object store and shared by every reader.
+- **Line diffs** trim the common head and tail before the LCS table runs, so
+  appends and small edits never build the table at all.
+- **Routing** splits the raw request target directly instead of running the
+  WHATWG URL parser per request, keeping the small-GET path cheap.
 
-State lives in memory for the length of the run. Every timestamp derives from
-`MAKEFUN_TRIAL_NOW` plus a per-process sequence, so a replayed trial produces
-identical responses.
-
-## Layout
-
-- `main.ts` — the entry ↔ env lifecycle (register, poll `/done`, exit).
-- `app.ts` — the HTTP router and auth.
-- `gitcore.ts` — SHA-1 object model, packfiles, deltas, pkt-lines.
-- `githttp.ts` — smart-HTTP advertisement, upload-pack, receive-pack.
-- `forge.ts` — repositories, refs, issues, pull requests, merges, diffs.
-- `rest.ts` — the REST v3 surface.
-- `graphql.ts` — a small GraphQL parser and executor for the suite's documents.
-- `mcp.ts` — the MCP endpoint and its tools.
-- `webutil.ts` — shared HTTP helpers.
-
-## License
-
-MIT — see `LICENSE`.
+State is deterministic: every timestamp derives from `MAKEFUN_TRIAL_NOW`
+plus a per-process sequence, never from the wall clock, so a replayed trial
+produces byte-identical state.
