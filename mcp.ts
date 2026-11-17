@@ -2,14 +2,14 @@
 //
 // It speaks both eras the suite accepts: the 2026-07-28 revision, where
 // server/discover answers without a handshake, and the legacy initialize /
-// notifications/initialized handshake. The tools act on the same store as
+// notifications/initialized handshake. The tools act on the same state as
 // REST and GraphQL, so an object made over one surface reads back over the
-// others, ids unchanged. The tools/list answer comes from a fixed table, so
-// two calls return it byte for byte.
+// others, ids unchanged. The tools/list answer comes from a fixed table,
+// so two calls return it byte for byte.
 
 import type { ServerResponse } from 'node:http';
-import { VIEWER, type Forge, type Issue, type Pull, type Repo } from './forge.ts';
 import { isRecord } from './webutil.ts';
+import { VIEWER, type Forge, type Issue, type Pull, type Repo } from './forge.ts';
 
 const SERVER_INFO = { name: 'forge', version: '1.0.0' };
 const SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
@@ -218,6 +218,7 @@ function runTool(forge: Forge, tool: ToolDef, args: Record<string, unknown>): un
         pull.mergedAt = forge.nowIso();
         pull.mergeCommitSha = sha;
         pull.updatedAt = pull.mergedAt;
+        forge.touch();
       }
       return pullView(forge, repo, pull);
     }

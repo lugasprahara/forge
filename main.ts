@@ -1,5 +1,5 @@
-// main.ts -- the trial entrypoint: the handshake around the forge, nothing of
-// the forge itself (that is app.ts and the modules behind it).
+// main.ts -- the trial entrypoint: the handshake around the forge, nothing
+// of the forge itself (that is app.ts and the modules behind it).
 //
 // The suite starts beside this process and waits for it. The contract:
 //   1. bring the forge up on a port the kernel chooses (never 8080: the
@@ -14,9 +14,7 @@
 import type { Server } from 'node:http';
 import { createApp } from './app.ts';
 
-/** How often the completion endpoint is polled. */
 const POLL_MS = 500;
-/** How long registration is retried before the failure is fatal. */
 const REGISTER_BUDGET_MS = 20_000;
 
 function suiteBase(): string {
@@ -30,9 +28,9 @@ function pause(ms: number): Promise<void> {
 }
 
 /**
- * Hand the suite our port. The suite may not be accepting connections in the
- * first instants, so a failed attempt retries on a doubling delay until the
- * registration budget runs out.
+ * Hand the suite our port. The suite may not be accepting connections in
+ * the first instants, so a failed attempt retries on a doubling delay
+ * until the registration budget runs out.
  */
 async function registerWithSuite(base: string, port: number): Promise<void> {
   const deadline = Date.now() + REGISTER_BUDGET_MS;
@@ -61,8 +59,8 @@ async function registerWithSuite(base: string, port: number): Promise<void> {
 
 /**
  * One poll of the completion endpoint. Any trouble at all -- a refused
- * connection, a bad status, an unparseable body -- reads as "not done": the
- * trial ends only on an explicit {"done": true}.
+ * connection, a bad status, an unparseable body -- reads as "not done":
+ * the trial ends only on an explicit {"done": true}.
  */
 async function suiteHasFinished(base: string): Promise<boolean> {
   try {

@@ -1,15 +1,15 @@
 // graphql.ts -- the GraphQL v4 surface at POST /api/graphql.
 //
-// A hand-written tokenizer and parser cover the documents gh and
-// github-mcp-server send: operations with variables, aliases, fragments and
-// inline fragments, input objects, enum lists, and batched operations. A
-// small schema table drives execution over the forge store and answers
-// __type introspection. Unknown fields come back as GraphQL errors inside a
-// 200 body, never as HTTP errors; an unknown repository is data.repository
-// null with no errors at all.
+// A hand-written tokenizer and recursive-descent parser cover the documents
+// gh and the GitHub MCP server send: operations with variables, aliases,
+// fragments and inline fragments, input objects, enum lists, and batched
+// operations. A small schema table drives execution over the forge state
+// and answers __type introspection. Unknown fields come back as GraphQL
+// errors inside a 200 body, never as HTTP errors; an unknown repository is
+// data.repository null with no errors at all.
 
-import { VIEWER, type Forge, type Issue, type Pull, type Repo } from './forge.ts';
 import { isRecord } from './webutil.ts';
+import { VIEWER, type Forge, type Issue, type Pull, type Repo } from './forge.ts';
 
 // ---------------------------------------------------------------------------
 // global ids and cursors: opaque base64, stable across reads
@@ -124,14 +124,19 @@ function tokenize(source: string): Token[] {
     }
     if (/[0-9-]/.test(ch)) {
       let end = at;
-      while (end < source.length && /[0-9.eE+-]/.test(source[end]!)) end += 1;
+      while (end < source.length && /[0-9]/.test(source[end]!)) end += 1;
+      let isFloat = false;
+      if (source[end] === '.' || source[end] === 'e' || source[end] === 'E') {
+        isFloat = true;
+        end += 1;
+        while (end < source.length && /[0-9+-]/.test(source[end]!)) end += 1;
+      }
       const text = source.slice(at, end);
-      if (/[.eE]/.test(text)) tokens.push({ kind: 'float', value: Number(text) });
-      else tokens.push({ kind: 'int', value: parseInt(text, 10) });
+      tokens.push(isFloat ? { kind: 'float', value: Number(text) } : { kind: 'int', value: Number(text) });
       at = end;
       continue;
     }
-    throw new Error(`unexpected character ${JSON.stringify(ch)} in GraphQL document`);
+    throw new Error(`Unexpected character '${ch}' in GraphQL document`);
   }
   return tokens;
 }
@@ -152,21 +157,22 @@ type ValueNode =
 
 interface FieldNode {
   kind: 'field';
-  alias: string | null;
   name: string;
+  alias: string | null;
   args: Array<{ name: string; value: ValueNode }>;
   selectionSet: SelectionNode[] | null;
 }
 
 type SelectionNode =
   | FieldNode
-  | { kind: 'inline'; typeCondition: string | null; selectionSet: SelectionNode[] }
-  | { kind: 'spread'; name: string };
+  | { kind: 'spread'; name: string }
+  | { kind: 'inline'; typeCondition: string | null; selectionSet: SelectionNode[] };
 
 interface OperationNode {
   operation: 'query' | 'mutation';
   name: string | null;
   selectionSet: SelectionNode[];
+  defaults: Record<string, unknown>;
 }
 
 interface DocumentNode {
@@ -175,7 +181,7 @@ interface DocumentNode {
 }
 
 class Parser {
-  private pos = 0;
+  private at = 0;
   private readonly tokens: Token[];
 
   constructor(tokens: Token[]) {
@@ -183,13 +189,13 @@ class Parser {
   }
 
   private peek(): Token | undefined {
-    return this.tokens[this.pos];
+    return this.tokens[this.at];
   }
 
-  private take(): Token {
-    const token = this.tokens[this.pos];
-    if (token === undefined) throw new Error('unexpected end of GraphQL document');
-    this.pos += 1;
+  private next(): Token {
+    const token = this.tokens[this.at];
+    if (token === undefined) throw new Error('Unexpected end of GraphQL document');
+    this.at += 1;
     return token;
   }
 
@@ -200,154 +206,196 @@ class Parser {
 
   private eatPunct(value: string): boolean {
     if (!this.atPunct(value)) return false;
-    this.pos += 1;
+    this.at += 1;
     return true;
   }
 
   private expectPunct(value: string): void {
-    const token = this.take();
-    if (token.kind !== 'punct' || token.value !== value) {
-      throw new Error(`expected "${value}" in GraphQL document`);
-    }
+    if (!this.eatPunct(value)) throw new Error(`Expected '${value}' in GraphQL document`);
   }
 
-  private expectName(): string {
-    const token = this.take();
-    if (token.kind !== 'name') throw new Error('expected a name in GraphQL document');
+  private name(): string {
+    const token = this.next();
+    if (token.kind !== 'name') throw new Error('Expected a name in GraphQL document');
     return token.value;
   }
 
   parseDocument(): DocumentNode {
     const operations: OperationNode[] = [];
     const fragments = new Map<string, SelectionNode[]>();
-    while (this.pos < this.tokens.length) {
+    while (this.peek() !== undefined) {
       const token = this.peek()!;
       if (token.kind === 'punct' && token.value === '{') {
-        operations.push({ operation: 'query', name: null, selectionSet: this.parseSelectionSet() });
+        operations.push({
+          operation: 'query',
+          name: null,
+          selectionSet: this.selectionSet(),
+          defaults: {},
+        });
         continue;
       }
-      if (token.kind !== 'name') throw new Error('expected a definition in GraphQL document');
+      if (token.kind !== 'name') throw new Error('Unexpected token in GraphQL document');
       if (token.value === 'query' || token.value === 'mutation' || token.value === 'subscription') {
-        this.take();
+        this.next();
         let name: string | null = null;
-        if (this.peek()?.kind === 'name') name = this.expectName();
-        if (this.eatPunct('(')) this.skipBalanced('(', ')');
+        const head = this.peek();
+        if (head !== undefined && head.kind === 'name') name = this.name();
+        const defaults = this.atPunct('(') ? this.variableDefinitions() : {};
         this.skipDirectives();
         operations.push({
           operation: token.value === 'mutation' ? 'mutation' : 'query',
           name,
-          selectionSet: this.parseSelectionSet(),
+          selectionSet: this.selectionSet(),
+          defaults,
         });
         continue;
       }
       if (token.value === 'fragment') {
-        this.take();
-        const fragName = this.expectName();
-        const on = this.take();
-        if (on.kind !== 'name' || on.value !== 'on') throw new Error('expected "on" in fragment definition');
-        this.expectName();
+        this.next();
+        const fragName = this.name();
+        const onToken = this.next();
+        if (onToken.kind !== 'name' || onToken.value !== 'on') {
+          throw new Error('Expected `on` in fragment definition');
+        }
+        this.name(); // the type condition; spreads resolve by name alone here
         this.skipDirectives();
-        fragments.set(fragName, this.parseSelectionSet());
+        fragments.set(fragName, this.selectionSet());
         continue;
       }
-      throw new Error(`unexpected definition "${token.value}" in GraphQL document`);
+      throw new Error(`Unexpected definition '${token.value}' in GraphQL document`);
     }
     return { operations, fragments };
   }
 
-  /** Skip a balanced run; the opening token is already consumed. */
-  private skipBalanced(open: string, close: string): void {
-    let depth = 1;
-    while (this.pos < this.tokens.length && depth > 0) {
-      const token = this.take();
-      if (token.kind === 'punct' && token.value === open) depth += 1;
-      else if (token.kind === 'punct' && token.value === close) depth -= 1;
+  /** Variable definitions: only the default values matter to execution. */
+  private variableDefinitions(): Record<string, unknown> {
+    const defaults: Record<string, unknown> = {};
+    this.expectPunct('(');
+    while (!this.atPunct(')')) {
+      this.expectPunct('$');
+      const varName = this.name();
+      this.expectPunct(':');
+      this.skipType();
+      if (this.eatPunct('=')) {
+        const value = this.valueLiteral(false);
+        defaults[varName] = valueOf(value, {});
+      }
+      this.skipDirectives();
     }
+    this.expectPunct(')');
+    return defaults;
+  }
+
+  private skipType(): void {
+    if (this.eatPunct('[')) {
+      this.skipType();
+      this.expectPunct(']');
+    } else {
+      this.name();
+    }
+    this.eatPunct('!');
   }
 
   private skipDirectives(): void {
     while (this.atPunct('@')) {
-      this.take();
-      this.expectName();
-      if (this.eatPunct('(')) this.skipBalanced('(', ')');
+      this.next();
+      this.name();
+      if (this.atPunct('(')) this.arguments();
     }
   }
 
-  private parseSelectionSet(): SelectionNode[] {
-    this.expectPunct('{');
+  private arguments(): Array<{ name: string; value: ValueNode }> {
+    const args: Array<{ name: string; value: ValueNode }> = [];
+    this.expectPunct('(');
+    while (!this.atPunct(')')) {
+      const argName = this.name();
+      this.expectPunct(':');
+      args.push({ name: argName, value: this.valueLiteral(true) });
+    }
+    this.expectPunct(')');
+    return args;
+  }
+
+  private valueLiteral(allowVariables: boolean): ValueNode {
+    const token = this.next();
+    switch (token.kind) {
+      case 'int':
+        return { kind: 'int', value: token.value };
+      case 'float':
+        return { kind: 'float', value: token.value };
+      case 'string':
+        return { kind: 'string', value: token.value };
+      case 'punct': {
+        if (token.value === '$') {
+          if (!allowVariables) throw new Error('Variable in a constant position');
+          return { kind: 'variable', name: this.name() };
+        }
+        if (token.value === '[') {
+          const values: ValueNode[] = [];
+          while (!this.atPunct(']')) values.push(this.valueLiteral(allowVariables));
+          this.expectPunct(']');
+          return { kind: 'list', values };
+        }
+        if (token.value === '{') {
+          const fields: Array<{ name: string; value: ValueNode }> = [];
+          while (!this.atPunct('}')) {
+            const fieldName = this.name();
+            this.expectPunct(':');
+            fields.push({ name: fieldName, value: this.valueLiteral(allowVariables) });
+          }
+          this.expectPunct('}');
+          return { kind: 'object', fields };
+        }
+        break;
+      }
+      case 'name': {
+        if (token.value === 'true') return { kind: 'boolean', value: true };
+        if (token.value === 'false') return { kind: 'boolean', value: false };
+        if (token.value === 'null') return { kind: 'null' };
+        return { kind: 'enum', value: token.value };
+      }
+      default:
+        break;
+    }
+    throw new Error('Unexpected value in GraphQL document');
+  }
+
+  private selectionSet(): SelectionNode[] {
     const selections: SelectionNode[] = [];
-    while (!this.atPunct('}')) selections.push(this.parseSelection());
+    this.expectPunct('{');
+    while (!this.atPunct('}')) {
+      const token = this.peek();
+      if (token === undefined) throw new Error('Unterminated selection set');
+      if (token.kind === 'spread') {
+        this.next();
+        const head = this.peek();
+        if (head !== undefined && head.kind === 'name' && head.value === 'on') {
+          this.next();
+          const typeCondition = this.name();
+          this.skipDirectives();
+          selections.push({ kind: 'inline', typeCondition, selectionSet: this.selectionSet() });
+        } else {
+          selections.push({ kind: 'spread', name: this.name() });
+          this.skipDirectives();
+        }
+        continue;
+      }
+      let fieldName = this.name();
+      let alias: string | null = null;
+      if (this.eatPunct(':')) {
+        alias = fieldName;
+        fieldName = this.name();
+      }
+      const args = this.atPunct('(') ? this.arguments() : [];
+      this.skipDirectives();
+      const nested = this.atPunct('{') ? this.selectionSet() : null;
+      selections.push({ kind: 'field', name: fieldName, alias, args, selectionSet: nested });
+    }
     this.expectPunct('}');
     return selections;
   }
-
-  private parseSelection(): SelectionNode {
-    if (this.peek()?.kind === 'spread') {
-      this.take();
-      const next = this.peek();
-      if (next !== undefined && next.kind === 'name' && next.value === 'on') {
-        this.take();
-        const typeCondition = this.expectName();
-        this.skipDirectives();
-        return { kind: 'inline', typeCondition, selectionSet: this.parseSelectionSet() };
-      }
-      const name = this.expectName();
-      this.skipDirectives();
-      return { kind: 'spread', name };
-    }
-    let name = this.expectName();
-    let alias: string | null = null;
-    if (this.eatPunct(':')) {
-      alias = name;
-      name = this.expectName();
-    }
-    const args: FieldNode['args'] = [];
-    if (this.eatPunct('(')) {
-      while (!this.atPunct(')')) {
-        const argName = this.expectName();
-        this.expectPunct(':');
-        args.push({ name: argName, value: this.parseValue() });
-      }
-      this.expectPunct(')');
-    }
-    this.skipDirectives();
-    const selectionSet = this.atPunct('{') ? this.parseSelectionSet() : null;
-    return { kind: 'field', alias, name, args, selectionSet };
-  }
-
-  private parseValue(): ValueNode {
-    const token = this.take();
-    if (token.kind === 'punct' && token.value === '$') return { kind: 'variable', name: this.expectName() };
-    if (token.kind === 'int') return { kind: 'int', value: token.value };
-    if (token.kind === 'float') return { kind: 'float', value: token.value };
-    if (token.kind === 'string') return { kind: 'string', value: token.value };
-    if (token.kind === 'name') {
-      if (token.value === 'true') return { kind: 'boolean', value: true };
-      if (token.value === 'false') return { kind: 'boolean', value: false };
-      if (token.value === 'null') return { kind: 'null' };
-      return { kind: 'enum', value: token.value };
-    }
-    if (token.kind === 'punct' && token.value === '[') {
-      const values: ValueNode[] = [];
-      while (!this.atPunct(']')) values.push(this.parseValue());
-      this.expectPunct(']');
-      return { kind: 'list', values };
-    }
-    if (token.kind === 'punct' && token.value === '{') {
-      const fields: Array<{ name: string; value: ValueNode }> = [];
-      while (!this.atPunct('}')) {
-        const name = this.expectName();
-        this.expectPunct(':');
-        fields.push({ name, value: this.parseValue() });
-      }
-      this.expectPunct('}');
-      return { kind: 'object', fields };
-    }
-    throw new Error('unexpected value in GraphQL document');
-  }
 }
 
-/** Materialise a parsed value against the operation's variables. */
 function valueOf(node: ValueNode, variables: Record<string, unknown>): unknown {
   switch (node.kind) {
     case 'variable':
@@ -425,7 +473,7 @@ const ENUM_VALUES: Record<string, string[]> = {
 };
 
 // ---------------------------------------------------------------------------
-// wrapped values: the executor's view of store objects
+// wrapped values: the executor's view of forge state
 
 type Wrapped =
   | { kind: 'user' }
@@ -598,6 +646,7 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
       }
       node.issue.state = 'closed';
       node.issue.updatedAt = ctx.forge.nowIso();
+      ctx.forge.touch();
       return { kind: 'payload', typeName: 'CloseIssuePayload', value: node } as Wrapped;
     },
     createPullRequest: (ctx, _source, args) => {
@@ -639,6 +688,7 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
         node.pull.mergedAt = ctx.forge.nowIso();
         node.pull.mergeCommitSha = sha;
         node.pull.updatedAt = node.pull.mergedAt;
+        ctx.forge.touch();
       }
       return { kind: 'payload', typeName: 'MergePullRequestPayload', value: node } as Wrapped;
     },
@@ -656,6 +706,7 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
       };
       if (node.kind === 'issue') node.issue.comments.push(comment);
       else node.pull.comments.push(comment);
+      ctx.forge.touch();
       const edge: Wrapped = { kind: 'edge', typeName: 'CommentEdge', node: { kind: 'comment', repo: node.repo, comment }, cursor: null };
       return { kind: 'payload', typeName: 'AddCommentPayload', value: edge } as Wrapped;
     },
@@ -986,7 +1037,7 @@ export function executeGraphQL(forge: Forge, request: GraphQLRequest): Record<st
   }
   const ctx: Ctx = {
     forge,
-    variables: request.variables ?? {},
+    variables: { ...operation.defaults, ...(request.variables ?? {}) },
     fragments: document.fragments,
     errors: [],
   };

@@ -1,22 +1,29 @@
-// forge.ts -- the forge's state: repositories over one shared object store, their
-// labels, issues and pull requests, and the tree surgery the contents API and
-// pull merges perform.
+// forge.ts -- the forge's world: repositories over one shared object store,
+// their refs, labels, issues and pull requests, and the tree surgery behind
+// the contents API and pull merges.
 //
-// Everything lives in memory. Every timestamp the forge stamps derives from
-// MAKEFUN_TRIAL_NOW plus a per-process sequence counter -- never from the wall
-// clock -- so a trial and its replay stamp byte-identical state.
+// Everything lives in memory. Two counters keep the HTTP layer's memoization
+// honest:
+//   * `epoch` moves on every mutation of forge-level state (a repo, issue,
+//     pull, label or ref created, changed or deleted), and
+//   * the object store counts its own additions.
+// A cached answer keyed on both numbers describes exactly the world that
+// produced it, and no other.
+//
+// Every timestamp derives from MAKEFUN_TRIAL_NOW plus a per-process tick --
+// never the wall clock -- so a trial and its replay stamp identical state.
 
 import {
   ObjectStore,
-  ZERO_OID,
-  buildCommit,
-  buildTree,
-  commitAncestors,
-  isAncestor,
-  mergeBase,
-  parseTag,
-  peelToCommit,
-  type TreeEntry,
+  addTreeContents,
+  ancestorSet,
+  commonAncestor,
+  isAncestorOf,
+  peelCommit,
+  readTag,
+  writeCommit,
+  writeTree,
+  type TreeItem,
 } from './gitcore.ts';
 
 /** The one login the trial token names (the suite's fixed scenario viewer). */
@@ -28,10 +35,10 @@ export const VIEWER = {
   type: 'User',
 } as const;
 
-export const DEFAULT_BRANCH = 'main';
+export const HOME_BRANCH = 'main';
 
 /** MAKEFUN_TRIAL_NOW as milliseconds; a fixed fixture epoch when unset. */
-function trialNowMs(): number {
+function trialEpochMs(): number {
   const raw = (process.env.MAKEFUN_TRIAL_NOW ?? '').trim();
   if (raw !== '') {
     if (/^\d+$/.test(raw)) return Number(raw);
@@ -46,7 +53,7 @@ export interface Label {
   color: string;
 }
 
-export interface IssueComment {
+export interface Comment {
   id: number;
   body: string;
   createdAt: string;
@@ -60,7 +67,7 @@ export interface Issue {
   body: string;
   state: 'open' | 'closed';
   labels: string[];
-  comments: IssueComment[];
+  comments: Comment[];
   createdAt: string;
   updatedAt: string;
   /** Creation order across the whole forge (a stable sort key). */
@@ -78,49 +85,88 @@ export interface Pull {
   merged: boolean;
   mergedAt: string | null;
   mergeCommitSha: string | null;
-  comments: IssueComment[];
+  comments: Comment[];
   createdAt: string;
   updatedAt: string;
   seq: number;
 }
 
-export interface Repo {
-  /** REST id; also the GraphQL databaseId. */
-  id: number;
-  owner: string;
+export class Repo {
+  /** Bumped whenever a ref is written or deleted (drives git-HTTP caching). */
+  gitVersion = 0;
+
+  readonly id: number;
+  readonly owner: string;
   name: string;
   isPrivate: boolean;
   description: string;
   defaultBranch: string;
   /** Full ref name (refs/heads/x, refs/tags/y) -> object id. */
-  refs: Map<string, string>;
-  labels: Map<string, Label>;
-  issues: Map<number, Issue>;
-  pulls: Map<number, Pull>;
+  readonly refs: Map<string, string>;
+  readonly labels: Map<string, Label>;
+  readonly issues: Map<number, Issue>;
+  readonly pulls: Map<number, Pull>;
   /** Issues and pull requests share one number sequence, as on GitHub. */
   nextNumber: number;
-  createdAt: string;
-  seq: number;
+  readonly createdAt: string;
+  readonly seq: number;
+
+  constructor(
+    id: number,
+    owner: string,
+    name: string,
+    isPrivate: boolean,
+    description: string,
+    defaultBranch: string,
+    refs: Map<string, string>,
+    labels: Map<string, Label>,
+    issues: Map<number, Issue>,
+    pulls: Map<number, Pull>,
+    nextNumber: number,
+    createdAt: string,
+    seq: number,
+  ) {
+    this.id = id;
+    this.owner = owner;
+    this.name = name;
+    this.isPrivate = isPrivate;
+    this.description = description;
+    this.defaultBranch = defaultBranch;
+    this.refs = refs;
+    this.labels = labels;
+    this.issues = issues;
+    this.pulls = pulls;
+    this.nextNumber = nextNumber;
+    this.createdAt = createdAt;
+    this.seq = seq;
+  }
 }
 
 export class Forge {
   readonly store = new ObjectStore();
   readonly repos = new Map<string, Repo>();
+  /** Moves on every observable mutation; see the file header. */
+  epoch = 0;
   private entityCounter = 10_000;
-  private seqCounter = 0;
-  readonly baseNowMs = trialNowMs();
+  private tick = 0;
+  readonly epochMs = trialEpochMs();
 
-  /** The next deterministic timestamp: the trial's now plus one tick a stamp. */
-  nowIso(): string {
-    this.seqCounter += 1;
-    return new Date(this.baseNowMs + this.seqCounter * 1000).toISOString();
+  /** Mark the world changed: every memoized answer keyed so far is stale. */
+  touch(): void {
+    this.epoch += 1;
   }
 
-  /** The identity line for forge-authored commits, on the deterministic clock. */
-  forgeIdentity(): { text: string; timestamp: number } {
-    this.seqCounter += 1;
-    const seconds = Math.floor(this.baseNowMs / 1000) + this.seqCounter;
-    return { text: `${VIEWER.name} <${VIEWER.email}> ${seconds} +0000`, timestamp: seconds };
+  /** The next deterministic timestamp: the trial's now plus one tick. */
+  nowIso(): string {
+    this.tick += 1;
+    return new Date(this.epochMs + this.tick * 1000).toISOString();
+  }
+
+  /** The identity line for forge-authored commits, on the same clock. */
+  identity(): { text: string; seconds: number } {
+    this.tick += 1;
+    const seconds = Math.floor(this.epochMs / 1000) + this.tick;
+    return { text: `${VIEWER.name} <${VIEWER.email}> ${seconds} +0000`, seconds };
   }
 
   nextEntityId(): number {
@@ -132,34 +178,36 @@ export class Forge {
     return `${owner}/${name}`;
   }
 
-  /** A repository answers only to its owner; any other owner reads as absent. */
+  /** A repository answers only to its owner; any other owner reads absent. */
   getRepo(owner: string, name: string): Repo | null {
     if (owner !== VIEWER.login) return null;
     return this.repos.get(this.repoKey(owner, name)) ?? null;
   }
 
   createRepo(name: string, isPrivate: boolean, description: string): Repo {
-    const repo: Repo = {
-      id: this.nextEntityId(),
-      owner: VIEWER.login,
+    const repo = new Repo(
+      this.nextEntityId(),
+      VIEWER.login,
       name,
       isPrivate,
       description,
-      defaultBranch: DEFAULT_BRANCH,
-      refs: new Map(),
-      labels: new Map(),
-      issues: new Map(),
-      pulls: new Map(),
-      nextNumber: 1,
-      createdAt: this.nowIso(),
-      seq: this.seqCounter,
-    };
+      HOME_BRANCH,
+      new Map(),
+      new Map(),
+      new Map(),
+      new Map(),
+      1,
+      this.nowIso(),
+      this.tick,
+    );
     this.repos.set(this.repoKey(repo.owner, name), repo);
+    this.touch();
     return repo;
   }
 
   deleteRepo(repo: Repo): void {
     this.repos.delete(this.repoKey(repo.owner, repo.name));
+    this.touch();
   }
 
   /** Every repository, oldest first. */
@@ -168,7 +216,20 @@ export class Forge {
   }
 
   // -------------------------------------------------------------------------
-  // refs and branches
+  // refs: every write funnels through here so the version counters move
+
+  setRef(repo: Repo, ref: string, oid: string): void {
+    repo.refs.set(ref, oid);
+    repo.gitVersion += 1;
+    this.touch();
+  }
+
+  deleteRef(repo: Repo, ref: string): void {
+    if (repo.refs.delete(ref)) {
+      repo.gitVersion += 1;
+      this.touch();
+    }
+  }
 
   branchTip(repo: Repo, branch: string): string | null {
     return repo.refs.get(`refs/heads/${branch}`) ?? null;
@@ -177,7 +238,7 @@ export class Forge {
   /** The commit the default branch points at (through any tag), or null. */
   headCommit(repo: Repo): string | null {
     const tip = this.branchTip(repo, repo.defaultBranch);
-    return tip === null ? null : peelToCommit(this.store, tip);
+    return tip === null ? null : peelCommit(this.store, tip);
   }
 
   branchNames(repo: Repo): string[] {
@@ -188,109 +249,91 @@ export class Forge {
     return names.sort();
   }
 
-  /** Resolve a branch, a full ref, a tag or a raw oid to the commit it names. */
+  /** Resolve a branch, a full ref, a tag or a raw oid to its commit. */
   resolveCommit(repo: Repo, rev: string): string | null {
     let oid: string | null = null;
     if (repo.refs.has(rev)) oid = repo.refs.get(rev)!;
     else if (repo.refs.has(`refs/heads/${rev}`)) oid = repo.refs.get(`refs/heads/${rev}`)!;
     else if (repo.refs.has(`refs/tags/${rev}`)) oid = repo.refs.get(`refs/tags/${rev}`)!;
     else if (this.store.has(rev)) oid = rev;
-    return oid === null ? null : peelToCommit(this.store, oid);
+    return oid === null ? null : peelCommit(this.store, oid);
   }
 
   // -------------------------------------------------------------------------
-  // reading and writing paths inside a commit's tree
+  // paths inside trees
 
   /** A commit's top-level entries; the empty list for a null commit. */
-  treeEntriesOf(commitOid: string | null): TreeEntry[] {
+  topEntries(commitOid: string | null): TreeItem[] {
     if (commitOid === null) return [];
     const commit = this.store.commit(commitOid);
     return commit === null ? [] : (this.store.tree(commit.tree) ?? []);
   }
 
-  /** The blob oid at `path` inside a tree (walked segment by segment), or null. */
-  blobAtPath(treeOid: string, path: string): string | null {
+  private entryAt(treeOid: string, path: string): TreeItem | null {
     const segments = path.split('/').filter((part) => part !== '');
     let tree = treeOid;
     for (let index = 0; index < segments.length; index += 1) {
-      const entries = this.store.tree(tree);
-      if (entries === null) return null;
-      const entry = entries.find((candidate) => candidate.name === segments[index]);
-      if (entry === undefined) return null;
-      if (index === segments.length - 1) return entry.mode === '40000' ? null : entry.oid;
-      if (entry.mode !== '40000') return null;
-      tree = entry.oid;
+      const items = this.store.tree(tree);
+      if (items === null) return null;
+      const item = items.find((candidate) => candidate.name === segments[index]);
+      if (item === undefined) return null;
+      if (index === segments.length - 1) return item;
+      if (item.mode !== '40000') return null;
+      tree = item.oid;
     }
     return null;
   }
 
+  /** The blob oid at `path` inside a tree, or null. */
+  blobAt(treeOid: string, path: string): string | null {
+    const item = this.entryAt(treeOid, path);
+    return item === null || item.mode === '40000' ? null : item.oid;
+  }
+
   /** Whether `path` names a directory inside the tree. */
-  isDirAtPath(treeOid: string, path: string): boolean {
-    const segments = path.split('/').filter((part) => part !== '');
-    let tree = treeOid;
-    for (let index = 0; index < segments.length; index += 1) {
-      const entries = this.store.tree(tree);
-      if (entries === null) return false;
-      const entry = entries.find((candidate) => candidate.name === segments[index]);
-      if (entry === undefined) return false;
-      if (index === segments.length - 1) return entry.mode === '40000';
-      if (entry.mode !== '40000') return false;
-      tree = entry.oid;
-    }
-    return false;
+  isDirAt(treeOid: string, path: string): boolean {
+    const item = this.entryAt(treeOid, path);
+    return item !== null && item.mode === '40000';
   }
 
   /** The entries of the directory at `path` ('' is the root), or null. */
-  dirEntries(treeOid: string, path: string): TreeEntry[] | null {
-    let tree = treeOid;
-    if (path !== '') {
-      for (const segment of path.split('/').filter((part) => part !== '')) {
-        const entries = this.store.tree(tree);
-        if (entries === null) return null;
-        const entry = entries.find((candidate) => candidate.name === segment);
-        if (entry === undefined || entry.mode !== '40000') return null;
-        tree = entry.oid;
-      }
-    }
-    return this.store.tree(tree);
-  }
-
-  /** Every file path in a tree mapped to its blob oid (the store's cache). */
-  flattenTree(treeOid: string): Map<string, string> {
-    return this.store.flattenTree(treeOid);
+  dirEntries(treeOid: string, path: string): TreeItem[] | null {
+    if (path === '') return this.store.tree(treeOid);
+    const item = this.entryAt(treeOid, path);
+    return item === null || item.mode !== '40000' ? null : this.store.tree(item.oid);
   }
 
   /**
-   * Return the tree that results from putting `blobOid` at `segments` under
-   * `treeOid` (a null blob deletes; a null tree starts empty). Intermediate
-   * directories that end up empty are pruned, as git trees cannot hold them.
+   * The tree that results from putting `blobOid` at `segments` under
+   * `treeOid` (a null blob deletes; a null tree starts empty). Directories
+   * left empty are pruned, as git trees cannot hold them.
    */
-  private writePathIntoTree(treeOid: string | null, segments: string[], blobOid: string | null): string {
-    const entries: TreeEntry[] = treeOid === null ? [] : [...(this.store.tree(treeOid) ?? [])];
+  private placeInTree(treeOid: string | null, segments: string[], blobOid: string | null): string {
+    const items: TreeItem[] = treeOid === null ? [] : [...(this.store.tree(treeOid) ?? [])];
     const head = segments[0]!;
     const rest = segments.slice(1);
-    const at = entries.findIndex((entry) => entry.name === head);
+    const at = items.findIndex((item) => item.name === head);
     if (rest.length === 0) {
       if (blobOid === null) {
-        if (at >= 0) entries.splice(at, 1);
+        if (at >= 0) items.splice(at, 1);
       } else if (at >= 0) {
-        entries[at] = { mode: '100644', name: head, oid: blobOid };
+        items[at] = { mode: '100644', name: head, oid: blobOid };
       } else {
-        entries.push({ mode: '100644', name: head, oid: blobOid });
+        items.push({ mode: '100644', name: head, oid: blobOid });
       }
     } else {
-      const existing = at >= 0 ? entries[at] : undefined;
+      const existing = at >= 0 ? items[at] : undefined;
       const subTree = existing !== undefined && existing.mode === '40000' ? existing.oid : null;
-      const newSub = this.writePathIntoTree(subTree, rest, blobOid);
+      const newSub = this.placeInTree(subTree, rest, blobOid);
       if ((this.store.tree(newSub) ?? []).length === 0) {
-        if (at >= 0) entries.splice(at, 1);
+        if (at >= 0) items.splice(at, 1);
       } else if (at >= 0) {
-        entries[at] = { mode: '40000', name: head, oid: newSub };
+        items[at] = { mode: '40000', name: head, oid: newSub };
       } else {
-        entries.push({ mode: '40000', name: head, oid: newSub });
+        items.push({ mode: '40000', name: head, oid: newSub });
       }
     }
-    return this.store.add('tree', buildTree(entries));
+    return this.store.add('tree', writeTree(items));
   }
 
   /** Commit a one-file change on a branch, creating the branch when needed. */
@@ -302,25 +345,27 @@ export class Forge {
     message: string,
   ): { commitOid: string; treeOid: string } {
     const parentTip = this.branchTip(repo, branch) ?? this.branchTip(repo, repo.defaultBranch);
-    const parentCommit = parentTip === null ? null : peelToCommit(this.store, parentTip);
+    const parentCommit = parentTip === null ? null : peelCommit(this.store, parentTip);
     const parentTree = parentCommit === null ? null : this.store.commit(parentCommit)!.tree;
-    const newTree = this.writePathIntoTree(
+    const newTree = this.placeInTree(
       parentTree,
       path.split('/').filter((part) => part !== ''),
       blobOid,
     );
-    const identity = this.forgeIdentity();
+    const identity = this.identity();
     const commitOid = this.store.add(
       'commit',
-      buildCommit({
+      writeCommit({
         tree: newTree,
         parents: parentCommit === null ? [] : [parentCommit],
-        message: message.endsWith('\n') ? message : `${message}\n`,
+        // Stored verbatim: the REST commits view echoes the message exactly
+        // as the writer sent it, trailing newline or none.
+        message,
         author: identity.text,
         committer: identity.text,
       }),
     );
-    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    this.setRef(repo, `refs/heads/${branch}`, commitOid);
     return { commitOid, treeOid: newTree };
   }
 
@@ -339,10 +384,11 @@ export class Forge {
       comments: [],
       createdAt: stamp,
       updatedAt: stamp,
-      seq: this.seqCounter,
+      seq: this.tick,
     };
     repo.nextNumber += 1;
     repo.issues.set(issue.number, issue);
+    this.touch();
     return issue;
   }
 
@@ -362,10 +408,11 @@ export class Forge {
       comments: [],
       createdAt: stamp,
       updatedAt: stamp,
-      seq: this.seqCounter,
+      seq: this.tick,
     };
     repo.nextNumber += 1;
     repo.pulls.set(pull.number, pull);
+    this.touch();
     return pull;
   }
 
@@ -378,13 +425,13 @@ export class Forge {
   }
 
   /** The files a pull changes, diffed from its merge base to its head. */
-  pullDiff(repo: Repo, pull: Pull): Array<{ path: string; status: string; additions: number; deletions: number }> {
+  pullDiff(repo: Repo, pull: Pull): FileChange[] {
     const { head, base } = this.pullTips(repo, pull);
     if (head === null || base === null) return [];
-    const headCommit = peelToCommit(this.store, head);
-    const baseCommit = peelToCommit(this.store, base);
+    const headCommit = peelCommit(this.store, head);
+    const baseCommit = peelCommit(this.store, base);
     if (headCommit === null || baseCommit === null) return [];
-    const from = mergeBase(this.store, baseCommit, headCommit) ?? baseCommit;
+    const from = commonAncestor(this.store, baseCommit, headCommit) ?? baseCommit;
     const fromTree = this.store.commit(from)?.tree;
     const toTree = this.store.commit(headCommit)?.tree;
     if (fromTree === undefined || toTree === undefined) return [];
@@ -393,65 +440,70 @@ export class Forge {
 
   /** Whether merging `pull` now would conflict (a file-level three-way test). */
   pullConflicts(repo: Repo, pull: Pull): boolean {
-    const { head, base } = this.pullTips(repo, pull);
-    if (head === null || base === null) return true;
-    const headCommit = peelToCommit(this.store, head);
-    const baseCommit = peelToCommit(this.store, base);
-    if (headCommit === null || baseCommit === null) return true;
-    const baseOfMerge = mergeBase(this.store, baseCommit, headCommit);
-    if (baseOfMerge === null) return true;
+    const tips = this.pullMergeCommits(repo, pull);
+    if (tips === null) return true;
     return (
       threeWayMerge(
         this.store,
-        this.store.commit(baseOfMerge)!.tree,
-        this.store.commit(baseCommit)!.tree,
-        this.store.commit(headCommit)!.tree,
+        this.store.commit(tips.baseOfMerge)!.tree,
+        this.store.commit(tips.baseCommit)!.tree,
+        this.store.commit(tips.headCommit)!.tree,
       ) === null
     );
   }
 
-  /**
-   * Squash-merge a pull request: a single new commit on the base branch whose
-   * tree is the three-way merge of the head into the current base. Returns the
-   * new commit's oid, or null when the merge conflicts.
-   */
-  mergePull(repo: Repo, pull: Pull, message?: string): string | null {
+  /** The three commits a merge works from, or null when it cannot start. */
+  private pullMergeCommits(
+    repo: Repo,
+    pull: Pull,
+  ): { headCommit: string; baseCommit: string; baseOfMerge: string } | null {
     const { head, base } = this.pullTips(repo, pull);
     if (head === null || base === null) return null;
-    const headCommit = peelToCommit(this.store, head);
-    const baseCommit = peelToCommit(this.store, base);
+    const headCommit = peelCommit(this.store, head);
+    const baseCommit = peelCommit(this.store, base);
     if (headCommit === null || baseCommit === null) return null;
-    if (isAncestor(this.store, headCommit, baseCommit)) {
-      // The head is already contained in the base: the base tip is the result.
-      return baseCommit;
-    }
-    const baseOfMerge = mergeBase(this.store, baseCommit, headCommit);
+    const baseOfMerge = commonAncestor(this.store, baseCommit, headCommit);
     if (baseOfMerge === null) return null;
+    return { headCommit, baseCommit, baseOfMerge };
+  }
+
+  /**
+   * Squash-merge a pull request: one new commit on the base branch whose
+   * tree is the three-way merge of the head into the current base. Returns
+   * the new commit's oid, or null when the merge conflicts.
+   */
+  mergePull(repo: Repo, pull: Pull, message?: string): string | null {
+    const tips = this.pullMergeCommits(repo, pull);
+    if (tips === null) return null;
+    if (isAncestorOf(this.store, tips.headCommit, tips.baseCommit)) {
+      // The head is already contained in the base: the base tip is the result.
+      return tips.baseCommit;
+    }
     const mergedTree = threeWayMerge(
       this.store,
-      this.store.commit(baseOfMerge)!.tree,
-      this.store.commit(baseCommit)!.tree,
-      this.store.commit(headCommit)!.tree,
+      this.store.commit(tips.baseOfMerge)!.tree,
+      this.store.commit(tips.baseCommit)!.tree,
+      this.store.commit(tips.headCommit)!.tree,
     );
     if (mergedTree === null) return null;
-    const identity = this.forgeIdentity();
+    const identity = this.identity();
     const commitOid = this.store.add(
       'commit',
-      buildCommit({
+      writeCommit({
         tree: mergedTree,
-        parents: [baseCommit],
+        parents: [tips.baseCommit],
         message: message ?? `${pull.title} (#${pull.number})\n`,
         author: identity.text,
         committer: identity.text,
       }),
     );
-    repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
+    this.setRef(repo, `refs/heads/${pull.baseRef}`, commitOid);
     return commitOid;
   }
 
   /** Commits reachable from `tip`, children always before their parents. */
-  listCommits(repo: Repo, tip: string): string[] {
-    const start = peelToCommit(this.store, tip) ?? (this.store.has(tip) ? tip : null);
+  listCommits(tip: string): string[] {
+    const start = peelCommit(this.store, tip) ?? (this.store.has(tip) ? tip : null);
     if (start === null) return [];
     const seen = new Set<string>();
     const out: string[] = [];
@@ -471,15 +523,30 @@ export class Forge {
   }
 
   commitAncestorsOf(tip: string): Set<string> {
-    return commitAncestors(this.store, tip);
+    return ancestorSet(this.store, tip);
   }
 
   /** The object an annotated tag names, or null when `oid` is not a tag. */
   tagTarget(oid: string): string | null {
     const object = this.store.get(oid);
     if (object === undefined || object.type !== 'tag') return null;
-    return parseTag(object.data).object;
+    return readTag(object.data).object;
   }
+
+  /** A tree plus everything beneath it, for reachability walks. */
+  addTreeContents(treeOid: string, into: Set<string>): void {
+    addTreeContents(this.store, treeOid, into);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// diffs and merges over flattened trees
+
+export interface FileChange {
+  path: string;
+  status: string;
+  additions: number;
+  deletions: number;
 }
 
 /** Lines in a blob; a trailing line without its newline still counts. */
@@ -493,9 +560,9 @@ export function countLines(data: Buffer): number {
 }
 
 /**
- * Addition/deletion counts between two texts, from their longest common
- * subsequence of lines. The shared head and tail are trimmed before the
- * quadratic table runs, which keeps the common cases (an append, a small
+ * Addition/deletion counts between two texts, from the longest common
+ * subsequence of their lines. The shared head and tail are trimmed before
+ * the quadratic table runs, keeping the common cases (an append, a small
  * edit) out of the table entirely.
  */
 export function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
@@ -531,15 +598,11 @@ export function lineDiff(oldText: string, newText: string): { additions: number;
 }
 
 /** The file-level diff between two trees: status and line counts per path. */
-export function diffTrees(
-  store: ObjectStore,
-  fromTree: string,
-  toTree: string,
-): Array<{ path: string; status: string; additions: number; deletions: number }> {
-  const from = store.flattenTree(fromTree);
-  const to = store.flattenTree(toTree);
+export function diffTrees(store: ObjectStore, fromTree: string, toTree: string): FileChange[] {
+  const from = store.flatten(fromTree);
+  const to = store.flatten(toTree);
   const paths = [...new Set([...from.keys(), ...to.keys()])].sort();
-  const out: Array<{ path: string; status: string; additions: number; deletions: number }> = [];
+  const out: FileChange[] = [];
   for (const path of paths) {
     const before = from.get(path);
     const after = to.get(path);
@@ -572,9 +635,9 @@ export function threeWayMerge(
   ourTree: string,
   theirTree: string,
 ): string | null {
-  const base = store.flattenTree(baseTree);
-  const ours = store.flattenTree(ourTree);
-  const theirs = store.flattenTree(theirTree);
+  const base = store.flatten(baseTree);
+  const ours = store.flatten(ourTree);
+  const theirs = store.flatten(theirTree);
   const merged = new Map<string, string>();
   for (const path of new Set([...base.keys(), ...ours.keys(), ...theirs.keys()])) {
     const b = base.get(path);
@@ -586,7 +649,6 @@ export function threeWayMerge(
     const winner = changedTheirs ? t : o;
     if (winner !== undefined) merged.set(path, winner);
   }
-  // Fold the flat winner map back into a hierarchy of tree objects.
   interface DirNode {
     files: Map<string, string>;
     dirs: Map<string, DirNode>;
@@ -608,12 +670,10 @@ export function threeWayMerge(
     node.files.set(segments[segments.length - 1]!, oid);
   }
   const build = (node: DirNode): string => {
-    const entries: TreeEntry[] = [];
-    for (const [name, oid] of node.files) entries.push({ mode: '100644', name, oid });
-    for (const [name, sub] of node.dirs) entries.push({ mode: '40000', name, oid: build(sub) });
-    return store.add('tree', buildTree(entries));
+    const items: TreeItem[] = [];
+    for (const [name, oid] of node.files) items.push({ mode: '100644', name, oid });
+    for (const [name, sub] of node.dirs) items.push({ mode: '40000', name, oid: build(sub) });
+    return store.add('tree', writeTree(items));
   };
   return build(root);
 }
-
-export { ZERO_OID };

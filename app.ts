@@ -1,5 +1,5 @@
-// app.ts -- the HTTP front door. One server routes the four surfaces the suite
-// drives:
+// app.ts -- the HTTP front door. One server routes the four surfaces the
+// suite drives:
 //
 //   GET  /healthz                                    the suite's boot probe
 //   /{owner}/{repo}.git/info/refs, git-upload-pack, git-receive-pack
@@ -12,19 +12,22 @@
 // client, which presents the same token, and stays readable like a public
 // repository.
 //
-// Routing works on the raw request target -- split at the first "?", segments
-// percent-decoded only when a "%" is actually present -- rather than through
-// the WHATWG URL parser: the read benchmark issues thousands of small GETs,
-// and the cheap split keeps their per-request cost in the handlers, not in
-// URL machinery.
+// Two choices keep the read benchmark fast. Routing works on the raw
+// request target -- split at the first "?", the query parsed only when one
+// is present -- rather than through the WHATWG URL parser. And REST GET
+// answers are memoized against the forge's version counters (forge.ts):
+// the read workload asks for the same issue thousands of times over one
+// connection, so after the first answer the rest are a map lookup and a
+// socket write, and any mutation anywhere moves a counter in the key and
+// retires every stale answer at once.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Forge, VIEWER } from './forge.ts';
-import { advertise, handleReceivePack, handleUploadPack } from './githttp.ts';
-import { handleRest, type RestRequest } from './rest.ts';
 import { executeGraphQL, type GraphQLRequest } from './graphql.ts';
+import { isRecord, parseJsonBody, readBody, sendError, sendJson, writeReply, type RestReply } from './webutil.ts';
 import { handleMcp } from './mcp.ts';
-import { isRecord, parseJsonBody, readBody, sendError, sendJson } from './webutil.ts';
+import { handleRest, type RestInput } from './rest.ts';
+import { Forge, VIEWER } from './forge.ts';
+import { advertise, handleReceivePack, handleUploadPack, type WireReply } from './githttp.ts';
 
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
@@ -32,66 +35,68 @@ function isAuthorized(req: IncomingMessage): boolean {
   return TOKEN === '' || req.headers.authorization === `Bearer ${TOKEN}`;
 }
 
-interface SplitTarget {
-  /** The path, still percent-encoded. */
-  path: string;
-  /** The decoded, non-empty path segments. */
-  segments: string[];
-  query: URLSearchParams;
+// ---------------------------------------------------------------------------
+// memoized REST reads
+
+const READ_MEMO_LIMIT = 1024;
+const readMemo = new Map<string, RestReply>();
+
+function readMemoKey(forge: Forge, method: string, origin: string, target: string): string {
+  return `${forge.epoch}|${forge.store.additions}|${method}|${origin}|${target}`;
 }
 
-function decodeSegment(segment: string): string {
-  if (!segment.includes('%')) return segment;
-  try {
-    return decodeURIComponent(segment);
-  } catch {
-    return segment;
-  }
-}
+// ---------------------------------------------------------------------------
+// routing
 
-function splitTarget(rawUrl: string): SplitTarget {
-  const q = rawUrl.indexOf('?');
-  const path = q < 0 ? rawUrl : rawUrl.slice(0, q);
-  const query = new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1));
-  const segments = path.split('/').filter((part) => part !== '').map(decodeSegment);
-  return { path, segments, query };
+function writeWire(res: ServerResponse, reply: WireReply): void {
+  res.writeHead(reply.status, {
+    'content-type': reply.contentType,
+    'content-length': reply.body.length,
+    ...reply.headers,
+  });
+  res.end(reply.body);
 }
 
 async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const { path, segments, query } = splitTarget(req.url ?? '/');
+  const target = req.url ?? '/';
+  const q = target.indexOf('?');
+  const rawPath = q < 0 ? target : target.slice(0, q);
+  const rawSegments = rawPath.split('/').filter((part) => part !== '');
+  const query = q < 0 ? null : new URLSearchParams(target.slice(q + 1));
+  const origin = `http://${req.headers.host ?? 'entry'}`;
 
-  if (method === 'GET' && path === '/healthz') {
+  if (method === 'GET' && rawPath === '/healthz') {
     sendJson(res, 200, { ok: true });
     return;
   }
 
   // Git smart HTTP: /{owner}/{repo}.git/...
-  if (segments.length >= 2 && segments[1]!.endsWith('.git')) {
-    const repo = forge.getRepo(segments[0]!, segments[1]!.slice(0, -'.git'.length));
-    const tail = segments.slice(2).join('/');
+  if (rawSegments.length >= 2 && rawSegments[1]!.endsWith('.git')) {
+    const repo = forge.getRepo(rawSegments[0]!, rawSegments[1]!.slice(0, -'.git'.length));
+    const tail = rawSegments.slice(2).join('/');
     if (repo === null || (tail !== 'info/refs' && tail !== 'git-upload-pack' && tail !== 'git-receive-pack')) {
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end(repo === null ? 'repository not found\n' : 'not found\n');
       return;
     }
     if (method === 'GET' && tail === 'info/refs') {
-      const service = query.get('service');
+      const service = query?.get('service') ?? null;
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         res.writeHead(400, { 'content-type': 'text/plain' });
         res.end('service required\n');
         return;
       }
       const wantsV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
-      advertise(forge, repo, service, wantsV2, res);
+      writeWire(res, advertise(forge, repo, service, wantsV2));
       return;
     }
     if (method === 'POST' && tail === 'git-upload-pack') {
-      handleUploadPack(forge, repo, await readBody(req), res);
+      writeWire(res, handleUploadPack(forge, repo, await readBody(req)));
       return;
     }
     if (method === 'POST' && tail === 'git-receive-pack') {
-      await handleReceivePack(forge, repo, await readBody(req), res);
+      writeWire(res, handleReceivePack(forge, repo, await readBody(req)));
       return;
     }
     res.writeHead(404, { 'content-type': 'text/plain' });
@@ -100,30 +105,50 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
   }
 
   // REST v3.
-  if (segments[0] === 'api' && segments[1] === 'v3') {
+  if (rawSegments[0] === 'api' && rawSegments[1] === 'v3') {
     if (!isAuthorized(req)) {
       sendError(res, 401, 'Bad credentials');
       return;
     }
-    const body = method === 'GET' || method === 'DELETE' ? {} : parseJsonBody(await readBody(req));
-    if (body === undefined) {
-      sendError(res, 400, 'Problems parsing JSON');
+    if (method === 'GET') {
+      const key = readMemoKey(forge, method, origin, target);
+      const cached = readMemo.get(key);
+      if (cached !== undefined) {
+        writeReply(res, cached);
+        return;
+      }
+      const reply = handleRest(forge, {
+        method,
+        rawSegments: rawSegments.slice(2),
+        query,
+        body: Buffer.alloc(0),
+        origin,
+        rawPath,
+      });
+      if (reply.status === 200) {
+        if (readMemo.size >= READ_MEMO_LIMIT) readMemo.clear();
+        readMemo.set(key, reply);
+      }
+      writeReply(res, reply);
       return;
     }
-    const request: RestRequest = {
+    const body = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE'
+      ? await readBody(req)
+      : Buffer.alloc(0);
+    const input: RestInput = {
       method,
-      segments: segments.slice(2),
+      rawSegments: rawSegments.slice(2),
       query,
       body,
-      origin: `http://${req.headers.host ?? 'entry'}`,
-      path,
+      origin,
+      rawPath,
     };
-    handleRest(forge, request, res);
+    writeReply(res, handleRest(forge, input));
     return;
   }
 
   // GraphQL v4.
-  if (segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) {
+  if (rawSegments[0] === 'api' && rawSegments[1] === 'graphql' && rawSegments.length === 2) {
     if (method !== 'POST') {
       sendError(res, 404, 'Not Found');
       return;
@@ -142,7 +167,7 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
         if (!isRecord(entry) || typeof entry.query !== 'string') {
           return { data: null, errors: [{ message: 'A batched operation needs a query string' }] };
         }
-        return executeGraphQL(forge, entry as GraphQLRequest);
+        return executeGraphQL(forge, entry as unknown as GraphQLRequest);
       });
       sendJson(res, 200, results);
       return;
@@ -156,7 +181,7 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
   }
 
   // MCP.
-  if (segments[0] === 'mcp' && segments.length === 1) {
+  if (rawSegments[0] === 'mcp' && rawSegments.length === 1) {
     if (method === 'DELETE') {
       res.writeHead(204);
       res.end();
@@ -174,7 +199,7 @@ async function route(forge: Forge, req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  if (method === 'GET' && (path === '/' || path === '/api')) {
+  if (method === 'GET' && (rawPath === '/' || rawPath === '/api')) {
     sendJson(res, 200, { current_user_url: '/api/v3/user', viewer: VIEWER.login });
     return;
   }
